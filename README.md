@@ -140,6 +140,6 @@ Calibration, custom gestures and the `machines/` folder are also stored next to 
 | `AirMouse.spec` | PyInstaller build configuration |
 | `hand_landmarker.task` | MediaPipe hand-tracking model |
 | `rasengan.mp4`, `absolute_cinema.mp4` | FX mode videos |
-| `air_mouse_calibration.json` | Saved calibration thresholds |
-| `custom_gestures.json` | Recorded custom gestures |
+| `air_mouse_calibration.json` | Your calibration thresholds (created when you calibrate, not in git) |
+| `custom_gestures.json` | Your recorded gestures (created when you record one, not in git) |
 | `requirements.txt` | Python dependencies |

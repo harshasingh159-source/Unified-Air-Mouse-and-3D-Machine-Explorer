@@ -12,3 +12,7 @@ venv/
 # Runtime output
 screenshots/
 *.log
+
+# Personal settings (created by the app on first use)
+custom_gestures.json
+air_mouse_calibration.json
