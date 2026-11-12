@@ -48,6 +48,11 @@ the program downloads it on first run.
 | Scroll | **OK sign** (thumb + index pinched, other fingers up), then move your hand up/down |
 | Freeze cursor | Make a tight **fist** |
 | Alt+Tab | **Open palm**, then swipe right/left to cycle windows. Close your hand to pick one |
+| Zoom | **Two hands**: pinch **thumb + index** on both, then spread apart = zoom in, bring together = zoom out |
+
+Zoom sends Ctrl+mouse wheel to the window under the cursor, so point at what you want to zoom
+first. It works in browsers, maps, image viewers and Office. Press `Z` to turn it on or off.
+It is off in FX mode, where two hands trigger Absolute Cinema.
 
 **Calibrate** with `C`: pinch ring, pinky and index when asked. Your personal thresholds are saved
 to `air_mouse_calibration.json`.
@@ -112,7 +117,7 @@ Textures are not shown.
 | `E` | 3D explorer | `G` | Record gesture |
 | `P` | Pause | `U` | Remove last gesture |
 | `D` | Debug overlay | `Q` | Quit |
-| `C` | Calibrate (`Esc` cancels) | | |
+| `C` | Calibrate (`Esc` cancels) | `Z` | Two-hand zoom on/off |
 
 **Global pause:** `Ctrl+Alt+P` works from any window (needs `pynput`).
 

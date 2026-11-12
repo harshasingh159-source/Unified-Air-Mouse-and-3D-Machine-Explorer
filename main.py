@@ -19,6 +19,9 @@ AIR MOUSE (default)  -- any one hand:
                        swipe RIGHT = next window, LEFT = previous window.
                        Keep swiping to keep cycling; close your hand to pick.
                        (To move the cursor, curl at least one finger.)
+  Zoom ............... TWO HANDS: pinch thumb + index on both, then spread
+                       apart = zoom in, bring together = zoom out (Ctrl+wheel
+                       on the window under the cursor; Z turns it on/off)
   Calibrate .......... press C: pinch ring, pinky, index when asked. Your
                        personal thresholds are measured and saved to a file.
 
@@ -58,7 +61,8 @@ FX MODE (F):
 
 Keys (camera window focused):
   F fx mode   E 3D explorer   P pause   D debug   C calibrate (Esc cancels)
-  S swipe on/off   G record gesture   U remove last gesture   Q quit (or close the window)
+  S swipe on/off   Z two-hand zoom on/off   G record gesture   U remove last gesture
+  Q quit (or close the window)
 GLOBAL PAUSE: Ctrl+Alt+P works from ANY window (needs: pip install pynput)
 EMERGENCY STOP: slam your physical mouse into any screen corner
 (PyAutoGUI fail-safe) and the program exits and releases all buttons.
@@ -187,6 +191,14 @@ class Config:
     scroll_deadzone: float = 0.003   # ignore tiny hand jitter (frame fraction)
 
     lost_grace_frames: int = 6       # tolerate this many dropped frames
+
+    # Two-hand pinch zoom (air mouse mode, Z toggles): pinch thumb + index on BOTH
+    # hands, then spread apart = Ctrl+wheel up (zoom in), together = zoom out.
+    # Uses the calibrated thumb-index thresholds (scroll_pinch_close / _open).
+    zoom_enabled: bool = True
+    zoom_confirm_frames: int = 3     # both pinches must be held this many frames
+    zoom_step: float = 0.06          # change in hand gap (fraction of frame width) per zoom step
+    zoom_max_steps: int = 2          # at most this many zoom steps per frame
 
     # Custom gestures (press G to record one; saved in custom_gestures.json next to the program)
     gesture_match_dist: float = 0.25   # lower = stricter matching, fewer accidental triggers
@@ -881,6 +893,9 @@ class AirMouse:
         self.flash_text = ""
         self.flash_until = 0.0
 
+        # Two-hand pinch zoom (set from main; only used by the HUD)
+        self.zoom = None
+
         # Custom gestures (set from main)
         self.gestures = None
         self.cg = None            # gesture currently being held
@@ -1233,6 +1248,103 @@ class AirMouse:
 # ============================================================
 # FX helpers (Rasengan / Absolute Cinema)
 # ============================================================
+class TwoHandZoom:
+    """Two-hand pinch zoom for the air mouse.
+
+    Pinch thumb + index on BOTH hands: the cursor freezes and zoom takes over.
+    Moving the pinches apart sends Ctrl+wheel up (zoom in); moving them together
+    sends Ctrl+wheel down (zoom out). Browsers, maps, image viewers and Office
+    zoom on Ctrl+wheel, applied to the window under the (frozen) cursor.
+    """
+
+    WHEEL_NOTCH = 120          # one standard mouse-wheel click
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.enabled = cfg.zoom_enabled
+        self.reset()
+        self.t_last = -1e9
+
+    def reset(self):
+        self.n = 0                 # frames with both hands pinched
+        self.active = False
+        self.ref = None            # hand gap at the last zoom step
+        self.miss = 0
+        self.direction = 0         # last zoom direction, for the HUD
+        self.pins = None           # the two pinch points, for drawing
+
+    def _pinch(self, lm, w, h):
+        """(is_pinched, pinch_point) for one hand, with hysteresis."""
+        pts = np.array([[l.x * w, l.y * h] for l in lm])
+        scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
+        ratio = np.linalg.norm(pts[4] - pts[8]) / scale
+        limit = self.cfg.scroll_pinch_open if self.active else self.cfg.scroll_pinch_close
+        return ratio < limit, (pts[4] + pts[8]) / 2.0
+
+    def _send(self, steps):
+        mod = "command" if sys.platform == "darwin" else "ctrl"
+        pyautogui.keyDown(mod)
+        try:
+            pyautogui.scroll(steps * self.WHEEL_NOTCH)
+        finally:
+            pyautogui.keyUp(mod)
+
+    def update(self, hands, w, h, now):
+        """Returns True while zoom owns the hands (the mouse should do nothing)."""
+        if now - self.t_last > 0.3:          # not called for a while (other mode): start fresh
+            self.reset()
+        self.t_last = now
+        if not self.enabled:
+            self.reset()
+            return False
+
+        if len(hands) >= 2:
+            (p1, a), (p2, b) = self._pinch(hands[0], w, h), self._pinch(hands[1], w, h)
+            both = p1 and p2
+        else:
+            both = False
+
+        if not both:
+            if self.active and self.miss < self.cfg.lost_grace_frames:
+                self.miss += 1                # brief tracking drop: hold the zoom
+                return True
+            self.reset()
+            return False
+
+        self.miss = 0
+        self.n += 1
+        self.pins = (a, b)
+        gap = np.linalg.norm(a - b) / w
+        if not self.active:
+            if self.n < self.cfg.zoom_confirm_frames:
+                return True                   # pinches forming: keep the mouse still
+            self.active, self.ref = True, gap
+            return True
+
+        steps = int((gap - self.ref) / self.cfg.zoom_step)
+        if steps:
+            steps = max(-self.cfg.zoom_max_steps, min(self.cfg.zoom_max_steps, steps))
+            self._send(steps)
+            self.ref += steps * self.cfg.zoom_step
+            self.direction = 1 if steps > 0 else -1
+        return True
+
+    @property
+    def status(self):
+        if not self.active:
+            return "ZOOM: hold both pinches..."
+        return {1: "ZOOM IN  +", -1: "ZOOM OUT  -"}.get(self.direction, "ZOOM: spread / squeeze")
+
+    def draw(self, frame):
+        if self.pins is None:
+            return
+        a, b = (tuple(int(v) for v in p) for p in self.pins)
+        color = (0, 255, 255) if self.active else (180, 180, 180)
+        cv2.line(frame, a, b, color, 2)
+        for p in (a, b):
+            cv2.circle(frame, p, 9, color, 2)
+
+
 class LoopingVideo:
     def __init__(self, path):
         cap = cv2.VideoCapture(path) if os.path.exists(path) else None
@@ -1330,7 +1442,9 @@ def draw_hud(frame, am, fps, fx_mode=False):
     cv2.putText(frame, am.status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     n_g = len(am.gestures.items) if am.gestures is not None else 0
     cv2.putText(frame, f"FPS {fps:.0f} P:pause F:fx({'ON' if fx_mode else 'off'}) D:debug C:calib "
-                       f"S:swipe({'ON' if am.swipe_enabled else 'off'}) G:gesture({n_g}) E:3D Q:quit", (16, 52),
+                       f"S:swipe({'ON' if am.swipe_enabled else 'off'}) "
+                       f"Z:zoom({'ON' if am.zoom is not None and am.zoom.enabled else 'off'}) "
+                       f"G:gesture({n_g}) E:3D Q:quit", (16, 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
     if am.debug:
         cv2.putText(frame, am.dbg, (16, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
@@ -3278,6 +3392,8 @@ def main():
     gestures = GestureStore(GESTURES_PATH)
     recorder = GestureRecorder(gestures)
     am.gestures = gestures
+    zoom = TwoHandZoom(cfg)
+    am.zoom = zoom
     os.makedirs(cfg.machines_dir, exist_ok=True)   # so users can see where models go
     explorer = Explorer(cfg, builtin_machines() + load_machines(cfg.machines_dir, cfg.models_z_up))
     explore_mode = False           # 3D machine explorer mode (E), toggled just like FX mode (F)
@@ -3377,6 +3493,16 @@ def main():
             elif fx_mode and len(hands) >= 2:
                 am.on_no_hand()  # two hands appearing, wait for confirmation
 
+            elif not fx_mode and not am.paused and zoom.update(hands, w, h, now):
+                # ---- Two-hand pinch zoom: the cursor stays frozen ----
+                for hl in hands[:2]:
+                    draw_hand(frame, hl, w, h, cfg.pointer_landmark)
+                zoom.draw(frame)
+                am.release_all()
+                am.reset_filters()
+                am.lost = 0
+                am.status = zoom.status
+
             elif hands:
                 mouse_lm = fx_lm = None
                 if fx_mode:
@@ -3464,6 +3590,10 @@ def main():
                 am.toggle_pause()
             if key == ord("d"):
                 am.debug = not am.debug
+            if key == ord("z"):
+                zoom.enabled = not zoom.enabled
+                zoom.reset()
+                print("Two-hand pinch zoom:", "ON" if zoom.enabled else "off")
             if key == ord("s"):
                 am.swipe_enabled = not am.swipe_enabled
                 if not am.swipe_enabled:
