@@ -1,8 +1,8 @@
 {
-  "pinch_close": 0.287,
-  "pinch_open": 0.385,
-  "right_pinch_close": 0.335,
-  "right_pinch_open": 0.496,
-  "scroll_pinch_close": 0.543,
-  "scroll_pinch_open": 0.849
+  "pinch_close": 0.9,
+  "pinch_open": 1.452,
+  "right_pinch_close": 0.948,
+  "right_pinch_open": 1.591,
+  "scroll_pinch_close": 0.653,
+  "scroll_pinch_open": 1.033
 }

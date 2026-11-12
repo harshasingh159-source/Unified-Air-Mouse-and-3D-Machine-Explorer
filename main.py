@@ -2,6 +2,7 @@
 AIR MOUSE + FX + 3D MACHINE EXPLORER  (everything in one file)
 ==============================================================
 Uses MediaPipe HandLandmarker (VIDEO mode), OpenCV, NumPy and PyAutoGUI.
+Optional: pynput (enables the global pause hotkey).
 
 MODES  (toggle with a key; the default mode is the air mouse)
   F ........ FX mode        E ........ 3D MACHINE EXPLORER mode
@@ -21,6 +22,17 @@ AIR MOUSE (default)  -- any one hand:
   Calibrate .......... press C: pinch ring, pinky, index when asked. Your
                        personal thresholds are measured and saved to a file.
 
+CUSTOM GESTURES (air mouse and FX mode):
+  Record ............. press G, hold your own hand pose for 2 seconds, then press a
+                       number key to pick its action: 1 play/pause  2 next track
+                       3 previous track  4 volume up  5 volume down  6 mute
+                       7 copy  8 paste  9 undo  0 screenshot
+  Use it ............. make the pose and hold it for half a second
+  Remove ............. U deletes the most recent gesture
+  More actions ....... edit custom_gestures.json (key combos, open a site/app, type text)
+  Not allowed ........ open palm, pointing (1-2 fingers), plain fist and pinches,
+                       because those already do something
+
 FX MODE (F):
   Mouse hand ......... works exactly as above
   Peace sign (hold 1s) Opens YouTube in Chrome (mouse hand)
@@ -28,6 +40,7 @@ FX MODE (F):
   Both hands ......... Absolute Cinema (needs absolute_cinema.mp4)
 
 3D MACHINE EXPLORER MODE (E):  the mouse is switched off; your hands drive a 3D viewer
+  Built-in machines .. engine, gear reducer, robot arm, sedan, Bugatti Chiron-style hypercar
   Rotate ............. pinch THUMB + INDEX, then move your hand
   Zoom ............... pinch THUMB + RING, then move your hand up (in) / down (out)
   Select a part ...... point at it, then TAP thumb + MIDDLE (tap again to deselect)
@@ -35,14 +48,18 @@ FX MODE (F):
   Explode ............ TWO HANDS: move them apart = explode, together = assemble
   Reset view ......... hold a FIST for 1 second
   Next / previous .... swipe an OPEN PALM right / left to change machine
+  Physical mouse ..... drag = rotate, click = select, wheel = zoom
   Viewer keys ........ N/B machine  Space animate  X explode  [ ] explode less/more
                        Tab next part  I isolate  + - zoom  A D W S rotate  R reset
                        T auto-rotate  L labels  H hide help  G quality
-  Your own models .... put folders in  machines/<name>/  with .stl or .obj files
+  Your own models .... put folders in  machines/<name>/  (next to the program)
+                       with .stl, .obj or .glb/.gltf files
+                       (a car from Sketchfab etc. as .glb works; textures are not shown)
 
 Keys (camera window focused):
   F fx mode   E 3D explorer   P pause   D debug   C calibrate (Esc cancels)
-  S swipe on/off   Q quit
+  S swipe on/off   G record gesture   U remove last gesture   Q quit (or close the window)
+GLOBAL PAUSE: Ctrl+Alt+P works from ANY window (needs: pip install pynput)
 EMERGENCY STOP: slam your physical mouse into any screen corner
 (PyAutoGUI fail-safe) and the program exits and releases all buttons.
 """
@@ -56,6 +73,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import urllib.request
 import webbrowser
@@ -70,16 +88,42 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 
+# ============================================================
+# Paths
+#   resource_path() -> read-only files bundled with the app (PyInstaller _MEIPASS)
+#   app_dir()       -> writable folder next to the program (calibration, logs,
+#                      the machines/ folder, a downloaded hand model)
+# ============================================================
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+    """ Get absolute path to a bundled resource, works for dev and for PyInstaller """
+    base_path = getattr(sys, "_MEIPASS", app_dir())
     return os.path.join(base_path, relative_path)
 
 
-MODEL_PATH = resource_path("hand_landmarker.task")
+def setup_logging():
+    """In a windowed (no console) build stdout/stderr are None: send output to a log file."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log = open(os.path.join(app_dir(), "air_mouse.log"), "a", buffering=1, encoding="utf-8")
+        log.write(f"\n===== started {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        if sys.stdout is None:
+            sys.stdout = log
+        if sys.stderr is None:
+            sys.stderr = log
+    except OSError:
+        pass
+
+
+_BUNDLED_MODEL = resource_path("hand_landmarker.task")
+MODEL_PATH = (_BUNDLED_MODEL if os.path.exists(_BUNDLED_MODEL)
+              else os.path.join(app_dir(), "hand_landmarker.task"))
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task"
@@ -103,6 +147,7 @@ class Config:
     cam_index: int = 0
     cam_w: int = 640
     cam_h: int = 480
+    max_read_failures: int = 30      # consecutive failed camera reads before giving up
 
     # Active region: the part of the camera view that maps to the whole screen.
     # Smaller = less arm movement needed, but less precision.
@@ -143,6 +188,14 @@ class Config:
 
     lost_grace_frames: int = 6       # tolerate this many dropped frames
 
+    # Custom gestures (press G to record one; saved in custom_gestures.json next to the program)
+    gesture_match_dist: float = 0.25   # lower = stricter matching, fewer accidental triggers
+    gesture_hold_s: float = 0.5        # hold the pose this long before it fires
+    gesture_repeat_s: float = 0.35     # repeat interval for repeating actions (volume up/down)
+
+    # Global pause hotkey (works from any window; needs the pynput package)
+    global_pause_hotkey: str = "<ctrl>+<alt>+p"
+
     # FX mode. MediaPipe labels hands from the mirrored image. If mouse and
     # Rasengan are on the wrong hands, swap these two values.
     mouse_hand_label: str = "Left"
@@ -168,9 +221,43 @@ class Config:
     swipe_reverse_speed: float = 1.5     # unless it is a deliberate, fast flick like this
     alt_hold_s: float = 1.25           # keep Alt held this long after the last swipe
 
-    # 3D machine explorer mode (press E). Your own models go in machines/<name>/*.stl|*.obj
-    machines_dir: str = resource_path("machines")
+    # 3D machine explorer mode (press E). Your own models go in machines/<name>/ (.stl .obj .glb .gltf)
+    # This folder lives NEXT TO the program so users can add models to a packaged build.
+    machines_dir: str = os.path.join(app_dir(), "machines")
     models_z_up: bool = True         # CAD files are usually Z-up; set False if yours look sideways
+
+
+# ============================================================
+# Global pause hotkey (optional: needs pynput)
+# ============================================================
+class GlobalHotkey:
+    """Listens for a key combo system-wide on a background thread."""
+
+    def __init__(self, combo):
+        self._hit = threading.Event()
+        self.listener = None
+        try:
+            from pynput import keyboard
+            self.listener = keyboard.GlobalHotKeys({combo: self._hit.set})
+            self.listener.daemon = True
+            self.listener.start()
+            print(f"Global pause hotkey: {combo}")
+        except Exception as e:
+            print(f"Global pause hotkey unavailable ({e}). Install pynput to enable it.")
+
+    def poll(self):
+        """True once per press (safe to call every frame from the main thread)."""
+        if self._hit.is_set():
+            self._hit.clear()
+            return True
+        return False
+
+    def stop(self):
+        if self.listener is not None:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -205,12 +292,6 @@ def open_youtube_in_chrome(url):
 # ============================================================
 # Calibration (measure YOUR pinch distances, save them to a file)
 # ============================================================
-def app_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 CALIB_PATH = os.path.join(app_dir(), "air_mouse_calibration.json")
 CALIB_KEYS = ("pinch_close", "pinch_open", "right_pinch_close", "right_pinch_open",
               "scroll_pinch_close", "scroll_pinch_open")
@@ -356,6 +437,351 @@ class Calibrator:
 
 
 # ============================================================
+# Custom gestures: record your own hand pose (G) and give it an action
+# ============================================================
+GESTURES_PATH = os.path.join(app_dir(), "custom_gestures.json")
+_MOD = "command" if sys.platform == "darwin" else "ctrl"
+
+# The actions offered after recording a pose (pick with a number key).
+# More action types are possible by editing custom_gestures.json:
+#   {"type": "key",    "keys": ["playpause"]}           press key(s) one after another
+#   {"type": "hotkey", "keys": ["mod", "shift", "t"]}   a key combo ("mod" = Ctrl, or Cmd on a Mac)
+#   {"type": "open",   "target": "https://..." or a file / app path}
+#   {"type": "type",   "text": "hello"}                 types text
+#   {"type": "screenshot"}                              saves a PNG in screenshots/
+GESTURE_PRESETS = [
+    ("1", "Play / Pause", {"type": "key", "keys": ["playpause"]}, False),
+    ("2", "Next track", {"type": "key", "keys": ["nexttrack"]}, False),
+    ("3", "Previous track", {"type": "key", "keys": ["prevtrack"]}, False),
+    ("4", "Volume up", {"type": "key", "keys": ["volumeup"]}, True),
+    ("5", "Volume down", {"type": "key", "keys": ["volumedown"]}, True),
+    ("6", "Mute", {"type": "key", "keys": ["volumemute"]}, False),
+    ("7", "Copy", {"type": "hotkey", "keys": ["mod", "c"]}, False),
+    ("8", "Paste", {"type": "hotkey", "keys": ["mod", "v"]}, False),
+    ("9", "Undo", {"type": "hotkey", "keys": ["mod", "z"]}, False),
+    ("0", "Screenshot", {"type": "screenshot"}, False),
+]
+
+
+_NOTICE = {"text": "", "until": 0.0, "ok": True}
+
+
+def notify(text, ok=True, secs=4.0):
+    """Print a message AND show it in the camera window for a few seconds."""
+    print(text)
+    _NOTICE.update(text=text, ok=ok, until=time.perf_counter() + secs)
+
+
+def take_screenshot(path):
+    """Save a PNG of the whole screen to `path`. Tries several methods so it works
+    on most systems without extra setup; raises with the reasons if all fail."""
+    errors = []
+    if sys.platform == "darwin":                      # built into macOS
+        try:
+            r = subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
+            if r.returncode == 0 and os.path.exists(path):
+                return
+            errors.append("macOS blocked it - allow Screen Recording for this app in "
+                          "System Settings > Privacy & Security")
+        except Exception as e:
+            errors.append(f"screencapture: {e}")
+    try:                                              # fast, all monitors (pip install mss)
+        import mss
+        import mss.tools
+        with mss.mss() as sct:
+            shot = sct.grab(sct.monitors[0])
+            mss.tools.to_png(shot.rgb, shot.size, output=path)
+        if os.path.exists(path):
+            return
+    except ImportError:
+        errors.append("mss not installed")
+    except Exception as e:
+        errors.append(f"mss: {e}")
+    try:                                              # Pillow (pip install pillow)
+        from PIL import ImageGrab
+        ImageGrab.grab(all_screens=True).save(path)
+        if os.path.exists(path):
+            return
+    except ImportError:
+        errors.append("Pillow not installed")
+    except Exception as e:
+        errors.append(f"Pillow: {e}")
+    if sys.platform.startswith("linux"):              # desktop screenshot tools
+        for cmd in (["gnome-screenshot", "-f", path], ["spectacle", "-b", "-n", "-o", path],
+                    ["scrot", path], ["grim", path]):
+            if shutil.which(cmd[0]):
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=10)
+                    if os.path.exists(path):
+                        return
+                except Exception as e:
+                    errors.append(f"{cmd[0]}: {e}")
+    raise RuntimeError("; ".join(errors) or "no screenshot method available")
+
+
+def run_action(action, name=""):
+    """Perform a custom gesture's action. Errors are printed, never fatal."""
+    kind = action.get("type")
+    try:
+        if kind == "key":
+            pyautogui.press(list(action["keys"]))
+        elif kind == "hotkey":
+            pyautogui.hotkey(*[_MOD if k == "mod" else k for k in action["keys"]])
+        elif kind == "type":
+            pyautogui.write(str(action["text"]), interval=0.01)
+        elif kind == "open":
+            target = str(action["target"])
+            if target.startswith(("http://", "https://")):
+                webbrowser.open(target)
+            elif sys.platform.startswith("win"):
+                os.startfile(target)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
+        elif kind == "screenshot":
+            folder = os.path.join(app_dir(), "screenshots")
+            os.makedirs(folder, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            path = os.path.join(folder, f"screenshot_{stamp}.png")
+            n = 2
+            while os.path.exists(path):                      # never overwrite an earlier shot
+                path = os.path.join(folder, f"screenshot_{stamp}_{n}.png")
+                n += 1
+            take_screenshot(path)
+            notify(f"Screenshot saved: {path}")
+            return
+        else:
+            notify(f"Gesture '{name}': unknown action type {kind!r}", ok=False)
+            return
+        print(f"Gesture: {name}")
+    except Exception as e:
+        notify(f"Gesture '{name}' failed: {e}", ok=False, secs=7.0)
+
+
+def pose_shape(pts):
+    """Hand pose as 20 points relative to the wrist, scaled by hand size and turned
+    so the palm points 'up'. The same pose gives the same shape wherever the hand
+    is in the frame, at any distance, and tilted sideways."""
+    p = np.asarray(pts, float)[:, :2] - pts[0][:2]
+    v = p[9]
+    s = float(np.linalg.norm(v)) + 1e-6
+    u = v / s                                   # wrist -> middle knuckle
+    r = np.array([-u[1], u[0]])
+    return np.stack([p @ r, -(p @ u)], 1)[1:] / s
+
+
+_TIP_ROWS = [3, 7, 11, 15, 19]                  # fingertips (landmarks 4, 8, 12, 16, 20)
+
+
+def shape_distance(a, b):
+    """0 = identical pose. Mixes the average point difference with the worst
+    fingertip difference, so a single finger (e.g. a raised thumb) counts."""
+    d = np.linalg.norm(a - b, axis=1)
+    return 0.5 * float(d.mean()) + 0.5 * float(d[_TIP_ROWS].max())
+
+
+def looks_like_click(ratios, fingers, cfg):
+    """True if this hand would trigger a built-in click, right click or scroll
+    (the same rules AirMouse.on_hand uses)."""
+    ti, tr, tp = ratios
+    index, middle, ring, pinky = fingers
+    return ((not ring and tr < cfg.pinch_close and tr <= tp)              # left click
+            or (not pinky and tp < cfg.right_pinch_close and tp < tr)     # right click
+            or (ti < cfg.scroll_pinch_close and middle and ring and pinky))  # scroll (OK sign)
+
+
+class CustomGesture:
+    def __init__(self, name, action, repeat, pattern, samples):
+        self.name = name
+        self.action = action
+        self.repeat = bool(repeat)
+        self.pattern = tuple(bool(x) for x in pattern)      # index, middle, ring, pinky extended
+        self.samples = np.asarray(samples, float).reshape(-1, 20, 2)
+        mirrored = self.samples.copy()
+        mirrored[:, :, 0] *= -1                             # works with either hand
+        self.all = np.concatenate([self.samples, mirrored])
+
+    def distance(self, shape):
+        return min(shape_distance(shape, s) for s in self.all)
+
+    def to_json(self):
+        return {"name": self.name, "action": self.action, "repeat": self.repeat,
+                "pattern": [int(x) for x in self.pattern],
+                "samples": np.round(self.samples.reshape(len(self.samples), -1), 3).tolist()}
+
+
+class GestureStore:
+    """Your recorded gestures, saved in custom_gestures.json next to the program."""
+
+    def __init__(self, path):
+        self.path = path
+        self.items = []
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            print(f"Could not read {self.path}: {e}")
+            return
+        for g in data.get("gestures", []):
+            try:
+                self.items.append(CustomGesture(g["name"], g["action"], g.get("repeat", False),
+                                                g["pattern"], g["samples"]))
+            except Exception as e:
+                print(f"Skipping a broken gesture in {self.path}: {e}")
+        if self.items:
+            print(f"Loaded {len(self.items)} custom gesture(s): " + ", ".join(g.name for g in self.items))
+
+    def save(self):
+        try:
+            with open(self.path, "w") as f:
+                json.dump({"version": 1, "gestures": [g.to_json() for g in self.items]}, f, indent=1)
+        except Exception as e:
+            print(f"Could not save gestures: {e}")
+
+    def add(self, gesture):
+        self.items.append(gesture)
+        self.save()
+
+    def remove_last(self):
+        if not self.items:
+            return None
+        g = self.items.pop()
+        self.save()
+        return g
+
+    def match(self, pts, pattern, max_dist):
+        """Best gesture for this hand, or (None, None). The fingers that are up must
+        match exactly, then the overall shape must be close enough."""
+        pattern = tuple(bool(x) for x in pattern)
+        cands = [g for g in self.items if g.pattern == pattern]
+        if not cands:
+            return None, None
+        shape = pose_shape(pts)
+        best, best_d = None, max_dist
+        for g in cands:
+            d = g.distance(shape)
+            if d < best_d:
+                best, best_d = g, d
+        return (best, best_d) if best is not None else (None, None)
+
+
+class GestureRecorder:
+    """G -> hold your pose -> press a number to pick its action."""
+    PREP_S = 2.5
+    CAPTURE_S = 2.0
+    MIN_SAMPLES = 12
+    KEEP_SAMPLES = 15
+
+    def __init__(self, store):
+        self.store = store
+        self.state = "idle"            # idle | pose | choose
+        self.t0 = 0.0
+        self.shapes, self.patterns, self.checks = [], [], []
+        self.pending = None
+        self.message = ""
+        self.message_until = 0.0
+
+    @property
+    def active(self):
+        return self.state != "idle"
+
+    @property
+    def choosing(self):
+        return self.state == "choose"
+
+    def _say(self, text, now, secs=4.0):
+        self.message = text
+        self.message_until = now + secs
+        print(text)
+
+    def start(self, now):
+        self.state, self.t0 = "pose", now
+        self.shapes, self.patterns, self.checks = [], [], []
+        self.pending = None
+        self.message_until = 0.0
+
+    def cancel(self, now):
+        if self.active:
+            self.state = "idle"
+            self._say("Gesture recording cancelled", now)
+
+    def update(self, landmarks, w, h, now, cfg):
+        if self.state != "pose":
+            return
+        el = now - self.t0
+        if el < self.PREP_S:
+            return
+        if el < self.PREP_S + self.CAPTURE_S:
+            if landmarks is not None:
+                pts = np.array([[l.x * w, l.y * h] for l in landmarks])
+                scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
+                self.shapes.append(pose_shape(pts))
+                self.patterns.append(tuple(fingers_extended(pts, cfg.extend_ratio)))
+                tight = all(np.linalg.norm(pts[t] - pts[0]) < cfg.fist_tip_ratio * scale
+                            for t in (8, 12, 16, 20))
+                tucked = np.linalg.norm(pts[4] - pts[6]) < 0.6 * scale
+                clicky = looks_like_click(hand_ratios(landmarks, w, h), self.patterns[-1], cfg)
+                self.checks.append((clicky, tight and tucked))
+            return
+        self._finish_pose(now, cfg)
+
+    def _finish_pose(self, now, cfg):
+        if len(self.shapes) < self.MIN_SAMPLES:
+            self.t0 = now
+            self.shapes, self.patterns, self.checks = [], [], []
+            print("Hand not visible enough - hold the pose again")
+            return
+        # keep only the frames that show the most common finger pattern
+        pattern = max(set(self.patterns), key=self.patterns.count)
+        keep = [i for i, p in enumerate(self.patterns) if p == pattern]
+        if len(keep) < self.MIN_SAMPLES:
+            self.state = "idle"
+            self._say("Pose was not steady - press G and hold it still", now, 5.0)
+            return
+        clicky = sum(self.checks[i][0] for i in keep) > len(keep) / 2
+        plain_fist = sum(self.checks[i][1] for i in keep) > len(keep) / 2
+        problem = None
+        if all(pattern):
+            problem = "an open palm is the Alt+Tab swipe"
+        elif pattern in ((True, False, False, False), (True, True, False, False)):
+            problem = "one or two fingers up is used for pointing"
+        elif plain_fist:
+            problem = "a plain fist is the freeze gesture"
+        elif clicky:
+            problem = "the thumb touches your ring / pinky finger (that is a click)"
+        if problem:
+            self.state = "idle"
+            self._say(f"Not saved: {problem}. Try a different pose (G).", now, 6.0)
+            return
+        idx = np.linspace(0, len(keep) - 1, min(self.KEEP_SAMPLES, len(keep))).round().astype(int)
+        self.pending = (pattern, [self.shapes[keep[i]] for i in idx])
+        self.state = "choose"
+
+    def choose(self, key, now):
+        """Number key pressed while choosing. Returns True if handled."""
+        for k, name, action, repeat in GESTURE_PRESETS:
+            if key == ord(k):
+                pattern, samples = self.pending
+                self.store.add(CustomGesture(name, action, repeat, pattern, samples))
+                self.state = "idle"
+                self._say(f"Saved gesture '{name}' ({len(self.store.items)} total)", now)
+                return True
+        return False
+
+    def display(self, now):
+        el = now - self.t0
+        if el < self.PREP_S:
+            return f"Get ready... {self.PREP_S - el:.1f}s", False, el / self.PREP_S
+        return "HOLD IT - recording", True, min((el - self.PREP_S) / self.CAPTURE_S, 1.0)
+
+
+# ============================================================
 # One Euro filter: smooth when slow, responsive when fast
 # ============================================================
 class OneEuro:
@@ -455,6 +881,14 @@ class AirMouse:
         self.flash_text = ""
         self.flash_until = 0.0
 
+        # Custom gestures (set from main)
+        self.gestures = None
+        self.cg = None            # gesture currently being held
+        self.cg_start = 0.0
+        self.cg_fired = None
+        self.cg_miss = 0
+        self.cg_pct = 0
+
     # ---------- state helpers ----------
     def release_all(self):
         if self.left_down:
@@ -474,6 +908,8 @@ class AirMouse:
         self.peace_armed = True
         self._release_alt()
         self.swipe_hist.clear()
+        self.cg = None
+        self.cg_miss = 0
 
     def reset_filters(self):
         self.fx.reset()
@@ -485,6 +921,9 @@ class AirMouse:
             self.release_all()
             self.reset_filters()
             self.status = "PAUSED"
+        else:
+            self.status = "NO HAND"
+        print("Air mouse", "PAUSED" if self.paused else "resumed")
 
     # ---------- no hand ----------
     def on_no_hand(self):
@@ -581,6 +1020,31 @@ class AirMouse:
         if self.alt_down and now - self.alt_last > self.cfg.alt_hold_s:
             self._release_alt()
 
+    def _custom_gesture(self, pts, pattern, raw, click_like, now):
+        """Track a held custom gesture; fire its action after gesture_hold_s.
+        Returns True while a custom gesture is being held (cursor + clicks pause)."""
+        cfg = self.cfg
+        g = None
+        if (self.gestures is not None and self.gestures.items and raw != "PALM"
+                and not click_like and not self.left_down and not self.left_pending
+                and not self.right_latched and self.ok_n == 0):
+            g, _ = self.gestures.match(pts, pattern, cfg.gesture_match_dist)
+        if g is not None:
+            self.cg_miss = 0
+            if self.cg is not g:
+                self.cg, self.cg_start, self.cg_fired = g, now, None
+            held = now - self.cg_start
+            self.cg_pct = int(min(held / cfg.gesture_hold_s, 1.0) * 100)
+            if held >= cfg.gesture_hold_s and (
+                    self.cg_fired is None or (g.repeat and now - self.cg_fired >= cfg.gesture_repeat_s)):
+                run_action(g.action, g.name)
+                self.cg_fired = now
+        elif self.cg is not None:
+            self.cg_miss += 1
+            if self.cg_miss > 3:                    # pose really ended: re-arm
+                self.cg = None
+        return self.cg is not None
+
     def on_hand(self, landmarks, w, h, now):
         if self.paused:
             return
@@ -632,6 +1096,10 @@ class AirMouse:
             if self.pose != "PALM":
                 self._release_alt()       # hand closed: pick the highlighted window
 
+        # ---------- Custom gestures (recorded with G) ----------
+        click_like = looks_like_click((idx_ratio, ring_ratio, pinky_ratio), (index, middle, ring, pinky), cfg)
+        custom_active = self._custom_gesture(pts, (index, middle, ring, pinky), raw, click_like, now)
+
         # ---------- Peace sign -> YouTube (FX mode only) ----------
         peace_shape = index and middle and not ring and not pinky and spread > cfg.peace_spread
         peace_active = self.fx_mode and peace_shape
@@ -671,12 +1139,9 @@ class AirMouse:
         # ---------- Buttons ----------
         # A fist or a peace sign often touches the thumb to the fingers:
         # never treat that as a click.
-        clicks_allowed = raw != "FIST" and not peace_shape and self.ok_n == 0
-        # Require the finger being pinched to actually be curled.
-        # This keeps a naturally close thumb/finger distance from triggering
-        # a click just because the hand is rotated toward the camera.
-        # The existing distance thresholds, hysteresis, and frame confirmation
-        # remain unchanged.
+        clicks_allowed = raw != "FIST" and not peace_shape and self.ok_n == 0 and not custom_active
+        # Require the finger being pinched to actually be curled, so a naturally
+        # close thumb/finger distance (hand rotated toward the camera) is not a click.
         want_left = (clicks_allowed and not ring
                      and ring_ratio < cfg.pinch_close
                      and ring_ratio <= pinky_ratio)
@@ -739,7 +1204,7 @@ class AirMouse:
         pinch_forming = ((want_left or want_right) and not self.left_down) or self.left_pending
         moving = self.left_down or (
             self.pose == "POINT" and not pinch_forming and not self.right_latched
-            and self.ok_n == 0 and not peace_active
+            and self.ok_n == 0 and not peace_active and not custom_active
         )
 
         if moving:
@@ -747,6 +1212,9 @@ class AirMouse:
             sx, sy = self._to_screen(p.x, p.y, now)
             pyautogui.moveTo(sx, sy)
             self.status = "DRAGGING" if self.left_down else "MOVE"
+        elif custom_active:
+            self.status = (f"GESTURE: {self.cg.name} {self.cg_pct}%" if self.cg_fired is None
+                           else f"GESTURE: {self.cg.name} (done)")
         elif peace_active:
             self.status = (f"YOUTUBE {self.peace_pct}%" if self.peace_armed
                            else "YOUTUBE OPENED")
@@ -858,13 +1326,21 @@ def draw_hud(frame, am, fps, fx_mode=False):
         (255, 255, 255), 1,
     )
     color = (0, 255, 255) if not am.paused else (0, 165, 255)
-    cv2.rectangle(frame, (8, 8), (620, 82 if am.debug else 62), (20, 20, 20), -1)
+    cv2.rectangle(frame, (8, 8), (w - 8, 82 if am.debug else 62), (20, 20, 20), -1)
     cv2.putText(frame, am.status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-    cv2.putText(frame, f"FPS {fps:.0f}  P:pause  F:fx({'ON' if fx_mode else 'off'})  D:debug  "
-                       f"C:calibrate  S:swipe({'ON' if am.swipe_enabled else 'off'})  E:3D  Q:quit", (16, 52),
+    n_g = len(am.gestures.items) if am.gestures is not None else 0
+    cv2.putText(frame, f"FPS {fps:.0f} P:pause F:fx({'ON' if fx_mode else 'off'}) D:debug C:calib "
+                       f"S:swipe({'ON' if am.swipe_enabled else 'off'}) G:gesture({n_g}) E:3D Q:quit", (16, 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
     if am.debug:
         cv2.putText(frame, am.dbg, (16, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
+    if time.perf_counter() < _NOTICE["until"]:          # gesture results, e.g. "Screenshot saved"
+        lines = textwrap.wrap(_NOTICE["text"], 84)[:3]
+        y0 = 92 if am.debug else 72
+        cv2.rectangle(frame, (8, y0), (w - 8, y0 + 8 + 16 * len(lines)), (20, 20, 20), -1)
+        color = (0, 255, 0) if _NOTICE["ok"] else (0, 0, 255)
+        for i, ln in enumerate(lines):
+            cv2.putText(frame, ln, (16, y0 + 18 + 16 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
 
 def draw_calibration(frame, calib, now):
@@ -885,13 +1361,36 @@ def draw_calibration(frame, calib, now):
         cv2.putText(frame, calib.message, (16, h - 18), font, 0.45, (0, 255, 255), 1)
 
 
+def draw_recorder(frame, rec, now):
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if rec.state == "pose":
+        status, capturing, frac = rec.display(now)
+        color = (0, 255, 0) if capturing else (0, 200, 255)
+        cv2.rectangle(frame, (8, h - 96), (w - 8, h - 8), (20, 20, 20), -1)
+        cv2.putText(frame, "NEW GESTURE   (Esc = cancel)", (16, h - 76), font, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, "Make your pose with the mouse hand and hold it still",
+                    (16, h - 52), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, status, (16, h - 30), font, 0.5, color, 1)
+        cv2.rectangle(frame, (16, h - 20), (16 + int((w - 32) * frac), h - 14), color, -1)
+    elif rec.state == "choose":
+        cv2.rectangle(frame, (8, h - 150), (w - 8, h - 8), (20, 20, 20), -1)
+        cv2.putText(frame, "Pose recorded! Press a number for its action   (Esc = cancel)",
+                    (16, h - 130), font, 0.48, (0, 255, 255), 1)
+        for i, (k, name, _, _) in enumerate(GESTURE_PRESETS):
+            col, row = i // 5, i % 5
+            cv2.putText(frame, f"{k}  {name}", (24 + col * 300, h - 104 + row * 21),
+                        font, 0.5, (255, 255, 255), 1)
+    elif now < rec.message_until:
+        cv2.rectangle(frame, (8, h - 40), (w - 8, h - 8), (20, 20, 20), -1)
+        cv2.putText(frame, rec.message, (16, h - 18), font, 0.45, (0, 255, 255), 1)
+
+
 # ============================================================
 # 3D MACHINE EXPLORER (software renderer: OpenCV + NumPy only)
 # ============================================================
-# ------------------------------------------------------------
 # Defaults for gesture thresholds (the air_mouse Config overrides these,
 # including your calibrated values)
-# ------------------------------------------------------------
 DEFAULTS = dict(
     pinch_close=0.45, pinch_open=0.70,
     right_pinch_close=0.55, right_pinch_open=0.85,
@@ -1021,6 +1520,70 @@ def gear(teeth, root, tip, h, phase=0.0):
     return V, F
 
 
+def prism(profile, width):
+    """Convex 2D side profile (x, y), counter-clockwise, extruded along z."""
+    P = np.asarray(profile, float)
+    n, h = len(P), width / 2.0
+    V = np.vstack([np.column_stack([P, np.full(n, -h)]),
+                   np.column_stack([P, np.full(n, h)])])
+    F = []
+    for i in range(n):
+        j = (i + 1) % n
+        F += [[i, j, n + j], [i, n + j, n + i]]            # side walls
+    for i in range(1, n - 1):
+        F += [[n, n + i, n + i + 1], [0, i + 1, i]]        # front / back caps
+    return V, np.array(F)
+
+
+def slab(length, thick, width, angle, center):
+    """Thin box whose long (y) axis is tilted by `angle` about z (slanted glass / pillars)."""
+    return place(box(thick, length, width), R=Rz(angle), T=center)
+
+
+def section(yb, yt, wb, wm, wt):
+    """Convex cross-section ring (z, y): half-width wb at the bottom, wm at ~55% height, wt at the top."""
+    s = np.array([0.0, 0.12, 0.28, 0.45, 0.62, 0.82, 1.0])
+    w = np.where(s <= 0.55,
+                 wb + (wm - wb) * np.sin(np.pi / 2 * np.minimum(s / 0.55, 1.0)),
+                 wm - (wm - wt) * (np.maximum(s - 0.55, 0.0) / 0.45) ** 1.5)
+    y = yb + s * (yt - yb)
+    return np.vstack([np.column_stack([w, y]), np.column_stack([-w[::-1], y[::-1]])])
+
+
+def loft(stations):
+    """Closed solid skinned through cross-section rings.
+    stations: [(x, ring)], ring = (n,2) array of (z, y) points, the same n for every station."""
+    n = len(stations[0][1])
+    S = len(stations)
+    V = np.array([[x, y, z] for x, ring in stations for z, y in ring], float)
+    quads = []
+    for i in range(S - 1):
+        for k in range(n):
+            k2 = (k + 1) % n
+            quads.append((i * n + k, i * n + k2, (i + 1) * n + k2, (i + 1) * n + k))
+
+    def tris(flip):
+        out = []
+        for a, b, d, c in quads:
+            out += [[a, d, b], [a, c, d]] if flip else [[a, b, d], [a, d, c]]
+        return out
+
+    a, b, d, _ = quads[0]                      # pick the winding that points away from the axis
+    nrm = np.cross(V[b] - V[a], V[d] - V[a])
+    ref = (V[:n].mean(0) + V[n:2 * n].mean(0)) / 2
+    flip = float(np.dot(nrm, (V[a] + V[b] + V[d]) / 3 - ref)) < 0
+    F = tris(flip)
+    for ring_i, outward in ((0, np.sign(stations[0][0] - stations[1][0])),
+                            (S - 1, np.sign(stations[-1][0] - stations[-2][0]))):
+        base = ring_i * n
+        for k in range(1, n - 1):
+            t = [base, base + k, base + k + 1]
+            if np.cross(V[t[1]] - V[t[0]], V[t[2]] - V[t[0]])[0] * outward < 0:
+                t = [t[0], t[2], t[1]]
+            F.append(t)
+    return V, np.array(F)
+
+
 def signed_volume(mesh):
     V, F = mesh
     a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
@@ -1077,8 +1640,9 @@ class Part:
 
 
 class Machine:
-    def __init__(self, name, parts, pose_fn=None, info=""):
+    def __init__(self, name, parts, pose_fn=None, info="", view=(0.55, 0.30)):
         self.name = name
+        self.view = view                  # default (yaw, pitch) of the camera
         self.parts = parts
         self.pose_fn = pose_fn
         self.animated = pose_fn is not None
@@ -1148,6 +1712,10 @@ CERAMIC = (226, 226, 216)
 ORANGE = (30, 135, 245)
 _SHINE.update({STEEL: 0.45, ALU: 0.40, GOLD: 0.50, CERAMIC: 0.35, COPPER: 0.40,
                IRON: 0.20, DARK: 0.15, ORANGE: 0.20, RED: 0.30, BLUE: 0.30})
+CHIRON_BLUE = (168, 88, 22)      # deep "French racing" blue
+CARBON = (44, 42, 42)
+TINT = (96, 78, 58)              # tinted glass
+_SHINE.update({CHIRON_BLUE: 0.60, CARBON: 0.35, TINT: 0.70})
 
 
 # ============================================================
@@ -1387,13 +1955,321 @@ def make_robot():
 
     return Machine("4-axis robot arm", parts, pose, "Base, shoulder, elbow, wrist")
 
+# ============================================================
+# Built-in machine 4: sedan car
+# ============================================================
+def make_car():
+    # Layout: length along x (front = +x), up = +y, width along z.
+    PAINT = BLUE
+    GLASS = (235, 205, 160)
 
-def builtin_machines():
-    return [make_engine(), make_gearbox(), make_robot()]
+    # ---------- chassis & powertrain ----------
+    chassis = merge(place(box(4.1, 0.10, 1.5), T=(0, 0.35, 0)),
+                    place(box(4.1, 0.10, 0.10), T=(0, 0.28, 0.6)),
+                    place(box(4.1, 0.10, 0.10), T=(0, 0.28, -0.6)))
+    engine = merge(place(box(1.0, 0.45, 0.8), T=(1.35, 0.65, 0)),
+                   *[place(tube(0.12, 0, 0.2, 14, axis="y"), T=(x, 0.98, 0))
+                     for x in (1.05, 1.25, 1.45, 1.65)])
+    trans = merge(place(tube(0.17, 0, 0.7, 20, axis="x"), T=(0.55, 0.58, 0)),
+                  place(tube(0.05, 0, 2.0, 12, axis="x"), T=(-0.8, 0.58, 0)))
+    exhaust = merge(place(tube(0.04, 0, 3.0, 10, axis="x"), T=(0.0, 0.46, 0.5)),
+                    place(tube(0.11, 0, 0.7, 16, axis="x"), T=(-1.6, 0.46, 0.5)))
+    tank = place(box(0.7, 0.25, 1.0), T=(-1.5, 0.58, 0))
+    axle_f = place(tube(0.06, 0, 1.9, 12, axis="z"), T=(1.4, 0.4, 0))
+    axle_r = place(tube(0.06, 0, 1.9, 12, axis="z"), T=(-1.4, 0.4, 0))
+
+    # ---------- body panels (side profiles, extruded across the car) ----------
+    lower = prism([(-2.2, 0.40), (2.2, 0.40), (2.25, 0.72), (1.95, 0.90),
+                   (-1.95, 0.92), (-2.25, 0.78)], 1.7)
+    hood = prism([(0.85, 0.92), (1.95, 0.90), (1.95, 0.97), (0.85, 0.99)], 1.66)
+    trunk = prism([(-1.95, 0.92), (-1.15, 0.92), (-1.15, 0.99), (-1.95, 0.99)], 1.66)
+    door_l = place(box(1.6, 0.5, 0.06), T=(-0.05, 0.68, 0.88))
+    door_r = place(box(1.6, 0.5, 0.06), T=(-0.05, 0.68, -0.88))
+    roof = place(box(1.2, 0.06, 1.5), T=(-0.17, 1.48, 0))
+    pillars = merge(
+        *[slab(0.658, 0.06, 0.06, 0.753, (0.625, 1.21, z)) for z in (0.75, -0.75)],     # A pillars
+        *[slab(0.625, 0.06, 0.06, -0.695, (-0.95, 1.21, z)) for z in (0.75, -0.75)],    # C pillars
+        *[place(box(0.08, 0.48, 0.06), T=(-0.10, 1.21, z)) for z in (0.75, -0.75)])     # B pillars
+    windows = merge(slab(0.658, 0.03, 1.44, 0.753, (0.625, 1.21, 0)),                   # windshield
+                    slab(0.625, 0.03, 1.44, -0.695, (-0.95, 1.21, 0)),                  # rear glass
+                    place(box(1.55, 0.42, 0.03), T=(-0.175, 1.21, 0.72)),               # side glass
+                    place(box(1.55, 0.42, 0.03), T=(-0.175, 1.21, -0.72)))
+    seats = merge(*[place(box(0.5, 0.12, 0.5), T=(-0.10, 1.03, z)) for z in (0.35, -0.35)],
+                  *[place(box(0.10, 0.34, 0.5), T=(-0.40, 1.20, z)) for z in (0.35, -0.35)])
+    wheel_in_car = place(tube(0.17, 0.13, 0.05, 20, axis="x"), T=(0.40, 1.20, 0.35))
+    bump_f = place(box(0.14, 0.28, 1.76), T=(2.30, 0.52, 0))
+    bump_r = place(box(0.14, 0.28, 1.76), T=(-2.30, 0.52, 0))
+    heads = merge(*[place(box(0.08, 0.14, 0.35), T=(2.26, 0.74, z)) for z in (0.55, -0.55)])
+    tails = merge(*[place(box(0.08, 0.14, 0.35), T=(-2.26, 0.74, z)) for z in (0.55, -0.55)])
+
+    # ---------- wheels (built at the origin, posed to each corner) ----------
+    tire = tube(0.40, 0.26, 0.30, 28, axis="z")
+    rim = merge(tube(0.27, 0, 0.20, 24, axis="z"),
+                tube(0.09, 0, 0.30, 12, axis="z"),
+                *[place(box(0.07, 0.52, 0.24), R=Rz(k * 2 * math.pi / 5)) for k in range(5)])
+    corners = [("Front Left", (1.4, 0.4, 0.95), 1), ("Front Right", (1.4, 0.4, -0.95), 1),
+               ("Rear Left", (-1.4, 0.4, 0.95), 0), ("Rear Right", (-1.4, 0.4, -0.95), 0)]
+
+    parts = [
+        Part("Chassis", chassis, IRON,
+             "Load-bearing floor and side rails. Everything else bolts to this frame.", (0, -1.5, 0)),
+        Part("Engine", engine, ORANGE,
+             "Burns fuel to make power. Sits under the hood and drives the gearbox.",
+             (1.6, 1.0, 0)),
+        Part("Transmission + Driveshaft", trans, STEEL,
+             "Gearbox changes torque and speed; the driveshaft carries power to the rear wheels.",
+             (0.4, 0.3, 0)),
+        Part("Exhaust", exhaust, DARK,
+             "Carries burnt gases away; the muffler quietens them.", (-0.5, -1.0, 1.4)),
+        Part("Fuel Tank", tank, COPPER, "Stores the fuel for the engine.", (-1.5, 0.3, 0)),
+        Part("Front Axle", axle_f, STEEL, "Connects the front wheels and lets them steer.", (1.0, -1.1, 0)),
+        Part("Rear Axle", axle_r, STEEL, "Connects the rear wheels and delivers drive torque.", (-1.0, -1.1, 0)),
+        Part("Body Shell", lower, PAINT,
+             "Main painted body that wraps the mechanicals and passenger floor.", (0, 0.5, 0), shine=0.55),
+        Part("Hood", hood, PAINT, "Lid over the engine bay.", (1.0, 1.8, 0), shine=0.55),
+        Part("Trunk Lid", trunk, PAINT, "Lid over the luggage space.", (-1.0, 1.6, 0), shine=0.55),
+        Part("Door (left)", door_l, PAINT, "Side door with hinges at the front edge.", (0, 0, 1.8), shine=0.55),
+        Part("Door (right)", door_r, PAINT, "Side door with hinges at the front edge.", (0, 0, -1.8), shine=0.55),
+        Part("Roof", roof, PAINT, "Panel closing the passenger cabin.", (0, 2.2, 0), shine=0.55),
+        Part("Pillars", pillars, DARK, "A, B and C pillars hold the roof up and protect occupants.", (0, 1.3, 0)),
+        Part("Windows", windows, GLASS, "Windshield, side and rear glass.", (0, 1.7, 0), shine=0.60),
+        Part("Seats", seats, DARK, "Front seats.", (-0.3, 0.9, 0)),
+        Part("Steering Wheel", wheel_in_car, STEEL, "Driver's steering input.", (1.0, 1.6, 0.6)),
+        Part("Front Bumper", bump_f, DARK, "Absorbs low-speed impacts.", (1.4, -0.2, 0)),
+        Part("Rear Bumper", bump_r, DARK, "Absorbs low-speed impacts.", (-1.4, -0.2, 0)),
+        Part("Headlights", heads, CERAMIC, "Light the road ahead.", (1.6, 0.8, 0)),
+        Part("Tail Lights", tails, RED, "Show your position and braking to following drivers.", (-1.6, 0.8, 0)),
+    ]
+    n_static = len(parts)
+    for name, c, _ in corners:
+        parts.append(Part(f"Tire {name}", tire, DARK, "Rubber tire gripping the road.",
+                          (np.sign(c[0]) * 1.0, 0, np.sign(c[2]) * 1.8)))
+    for name, c, _ in corners:
+        parts.append(Part(f"Rim {name}", rim, ALU, "Alloy wheel the tire is mounted on.",
+                          (np.sign(c[0]) * 1.0, 0, np.sign(c[2]) * 2.4)))
+    refine_parts(parts, 0.7)
+
+    def pose(t):
+        spin = t * 3.0
+        steer = 0.25 * math.sin(0.8 * t)
+        poses = [(I3, Z3)] * n_static
+        wheels = []
+        for _, c, front in corners:
+            R = (Ry(steer) if front else I3) @ Rz(-spin)
+            wheels.append((R, np.array(c, float)))
+        return poses + wheels + wheels          # tires first, then rims (same motion)
+
+    return Machine("Sedan car", parts, pose, "Chassis, powertrain, body, wheels", view=(-0.7, 0.22))
 
 
 # ============================================================
-# Loading your own STL / OBJ models
+# Built-in machine 5: Bugatti Chiron-style hypercar
+# (an original, simplified model built from the car's real proportions and
+#  signature features - NOT the manufacturer's CAD data)
+# ============================================================
+def _prof(points):
+    pts = sorted(points)
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return lambda x: float(np.interp(x, xs, ys))
+
+
+def make_chiron():
+    # +x = nose, +y = up, z = across the car. 1 unit = 1 metre (real car: 4.54 x 2.04 x 1.21 m).
+    FA, RA = 1.40, -1.40             # axle positions
+    RF, RR = 0.37, 0.385             # front / rear tire radius
+    ARCH = 0.44                      # wheel-arch radius
+
+    ytop = _prof([(-2.27, .74), (-2.0, .88), (-1.5, 1.0), (-0.95, .97), (-0.75, .93), (0.85, .92),
+                  (1.0, .92), (1.4, .92), (1.9, .86), (2.15, .70), (2.27, .60)])
+    wmax = _prof([(-2.27, .78), (-1.9, .92), (-1.4, 1.02), (0.5, 1.02), (1.4, 1.02),
+                  (1.7, .99), (2.0, .88), (2.27, .66)])
+
+    def ybot(x):
+        yb = 0.14
+        for ax, r in ((FA, RF), (RA, RR)):
+            dx = abs(x - ax)
+            if dx < ARCH:
+                yb = max(yb, r + math.sqrt(ARCH * ARCH - dx * dx))
+        return yb
+
+    def arch_xs(ax):
+        return [ax + ARCH * math.cos(t) for t in np.linspace(0, math.pi, 15)] + [ax + ARCH + 0.004, ax - ARCH - 0.004]
+
+    def body(xs):
+        st = []
+        for x in sorted({round(float(v), 4) for v in xs}, reverse=True):
+            yb = ybot(x)
+            yt = max(ytop(x), yb + 0.06)
+            wm = wmax(x)
+            st.append((x, section(yb, yt, 0.80 * wm, wm, 0.78 * wm)))
+        return loft(st)
+
+    body_front = body(list(np.linspace(0.95, 2.27, 10)) + arch_xs(FA))
+    body_mid = body(list(np.linspace(-0.95, 0.95, 11)))
+    body_rear = body(list(np.linspace(-2.27, -0.95, 10)) + arch_xs(RA))
+
+    # ---------- greenhouse, roof, spine ----------
+    cab_top = _prof([(0.85, .945), (0.60, 1.03), (0.30, 1.15), (0.10, 1.205), (-0.45, 1.21),
+                     (-0.70, 1.16), (-0.92, 1.0)])
+    cab_xs = [0.85, 0.75, 0.60, 0.45, 0.30, 0.15, 0.0, -0.2, -0.45, -0.60, -0.75, -0.85, -0.92]
+    cabin = loft([(x, section(ytop(x), max(cab_top(x), ytop(x) + 0.03), 0.79, 0.80, 0.50)) for x in cab_xs])
+    roof = loft([(x, section(cab_top(x) - 0.012, cab_top(x) + 0.02, 0.47, 0.47, 0.42))
+                 for x in (0.18, 0.05, -0.1, -0.3, -0.45, -0.58)])
+    spine = prism([(-2.15, 0.80), (-0.55, 0.80), (-0.55, 1.215), (-2.15, 1.0)], 0.06)
+    scoops = merge(*[place(box(0.55, 0.12, 0.30), T=(-1.05, 1.02, z)) for z in (0.50, -0.50)])
+
+    # ---------- front end ----------
+    grille = place(tube(0.22, 0.15, 0.05, 28, -0.55, math.pi + 0.55, axis="x"), T=(2.285, 0.37, 0))
+    grille_mesh = place(box(0.03, 0.28, 0.34), T=(2.275, 0.36, 0))
+    badge = place(tube(0.035, 0, 0.02, 16, axis="x"), T=(2.31, 0.44, 0))
+    heads = merge(*[place(box(0.03, 0.06, 0.30), T=(2.285, 0.49, z)) for z in (0.45, -0.45)],
+                  *[place(box(0.03, 0.04, 0.22), T=(2.285, 0.36, z)) for z in (0.50, -0.50)])
+    splitter = place(box(0.45, 0.03, 1.55), T=(2.30, 0.125, 0))
+    front_rad = place(box(0.10, 0.40, 0.95), T=(1.95, 0.38, 0))
+
+    # ---------- sides ----------
+    cline_L = place(tube(0.32, 0.29, 0.02, 28, 0.9, 2 * math.pi - 0.9, axis="z"), T=(-0.35, 0.56, 1.035))
+    cline_R = place(tube(0.32, 0.29, 0.02, 28, 0.9, 2 * math.pi - 0.9, axis="z"), T=(-0.35, 0.56, -1.035))
+    intake_L = place(box(0.30, 0.22, 0.03), T=(-0.30, 0.56, 1.03))
+    intake_R = place(box(0.30, 0.22, 0.03), T=(-0.30, 0.56, -1.03))
+    mirror_L = place(box(0.16, 0.09, 0.12), T=(0.48, 0.99, 1.03))
+    mirror_R = place(box(0.16, 0.09, 0.12), T=(0.48, 0.99, -1.03))
+    side_rad = merge(*[place(box(0.50, 0.28, 0.10), T=(-0.55, 0.52, z)) for z in (0.70, -0.70)])
+
+    # ---------- rear end ----------
+    tail = place(box(0.06, 0.05, 1.45), T=(-2.275, 0.64, 0))
+    diff_fins = merge(place(box(0.8, 0.03, 1.4), R=Rz(0.12)),
+                      *[place(box(0.8, 0.10, 0.02), R=Rz(0.12), T=(0, 0.06, z)) for z in (-0.45, -0.22, 0, 0.22, 0.45)])
+    diffuser = place(diff_fins, T=(-1.95, 0.16, 0))
+    exhaust = merge(*[place(tube(0.055, 0.04, 0.30, 16, axis="x"), T=(-2.30, y, z))
+                      for y in (0.30, 0.46) for z in (-0.13, 0.13)])
+    wing_blade = merge(prism([(0.22, 0), (0.10, 0.035), (-0.20, 0.03), (-0.26, 0), (-0.20, -0.02), (0.10, -0.025)], 1.70),
+                       *[place(box(0.50, 0.14, 0.02), T=(-0.02, 0.0, z)) for z in (0.86, -0.86)])
+    wing_pivot = np.array([-2.06, 1.10, 0.0])
+    wing_struts = merge(*[place(box(0.05, 0.27, 0.06), T=(-2.06, 0.975, z)) for z in (0.40, -0.40)])
+
+    # ---------- interior ----------
+    mono = place(box(2.0, 0.50, 1.40), T=(-0.05, 0.56, 0))
+    seats = merge(*[place(box(0.5, 0.10, 0.45), T=(-0.20, 0.52, z)) for z in (0.36, -0.36)],
+                  *[place(place(box(0.10, 0.48, 0.42), R=Rz(0.2)), T=(-0.45, 0.78, z)) for z in (0.36, -0.36)],
+                  *[place(box(0.08, 0.16, 0.26), T=(-0.52, 1.07, z)) for z in (0.36, -0.36)])
+    dash = place(box(0.45, 0.16, 1.55), T=(0.55, 0.96, 0))
+    steering = place(tube(0.15, 0.125, 0.035, 20, axis="x"), R=Rz(0.4), T=(0.32, 1.04, -0.36))
+
+    # ---------- powertrain: 8.0 L W16, four turbos, transaxle ----------
+    banks = [(-22.5, -0.17), (-7.5, -0.06), (7.5, 0.06), (22.5, 0.17)]
+    cyl = [place(tube(0.085, 0, 0.34, 12, axis="y"), R=Rx(math.radians(a)),
+                 T=(-1.30 + 0.20 * k + (0.10 if i % 2 else 0.0), 0.74, zo))
+           for i, (a, zo) in enumerate(banks) for k in range(4)]
+    engine = merge(place(box(0.95, 0.28, 0.50), T=(-1.0, 0.45, 0)),
+                   place(box(0.90, 0.10, 0.34), T=(-1.0, 1.00, 0)), *cyl)
+    crank = merge(place(tube(0.07, 0, 1.2, 16, axis="x"), T=(-1.0, 0, 0)),
+                  place(tube(0.20, 0, 0.06, 24, axis="x"), T=(-0.40, 0, 0)),
+                  place(box(0.04, 0.09, 0.07), T=(-0.40, 0.17, 0)))
+    turbos = merge(*[place(tube(0.08, 0.04, 0.16, 16, axis="z"), T=(-1.62, 0.86, z)) for z in (-0.34, -0.12, 0.12, 0.34)])
+    gearbox = merge(place(box(0.55, 0.42, 0.80), T=(-1.80, 0.40, 0)),
+                    place(tube(0.14, 0, 0.5, 20, axis="x"), T=(-1.45, 0.40, 0)))
+    axle_r = merge(place(tube(0.045, 0, 1.32, 12, axis="z"), T=(RA, RR, 0)),
+                   place(box(0.28, 0.24, 0.30), T=(RA, RR, 0)))
+    axle_f = place(tube(0.045, 0, 1.36, 12, axis="z"), T=(FA, RF, 0))
+
+    parts, posers = [], []
+
+    def add(name, mesh, color, desc, explode, pose=None, **kw):
+        parts.append(Part(name, mesh, color, desc, explode, **kw))
+        posers.append(pose)
+
+    add("Front Body", body_front, CHIRON_BLUE,
+        "Nose, hood and front fenders. The low, wide nose helps downforce and cooling.", (2.0, 0.9, 0))
+    add("Center Body", body_mid, CHIRON_BLUE,
+        "Doors and sills wrapped around the carbon monocoque passenger cell.", (0, 1.3, 0))
+    add("Rear Body", body_rear, CHIRON_BLUE,
+        "Engine cover and tail. The body tapers to keep air attached over the rear.", (-2.0, 0.9, 0))
+    add("Cabin Glass", cabin, TINT, "Tinted windshield, side and rear glass of the low greenhouse.", (0, 2.4, 0))
+    add("Carbon Roof", roof, CARBON, "Lightweight carbon-fibre roof panel.", (0, 3.0, 0))
+    add("Dorsal Spine", spine, CARBON,
+        "The central fin running to the tail. It stabilises airflow and ties the two-tone design together.",
+        (-1.2, 2.8, 0))
+    add("Engine Air Scoops", scoops, CARBON, "Feed air to the engine and turbochargers.", (-1.2, 2.2, 0))
+    add("Horseshoe Grille", grille, ALU, "Bugatti's signature horseshoe, in polished metal.", (3.0, 0.5, 0), shine=0.6)
+    add("Grille Mesh", grille_mesh, CARBON, "Mesh behind the horseshoe that lets cooling air in.", (2.6, 0.3, 0))
+    add("Badge", badge, RED, "The oval marque badge.", (3.4, 0.9, 0))
+    add("Headlights", heads, CERAMIC, "Slim LED headlight strips.", (2.4, 1.0, 0))
+    add("Front Splitter", splitter, CARBON, "Carbon lip that creates front downforce.", (2.2, -1.0, 0))
+    add("Front Radiator", front_rad, DARK, "Cools the engine coolant.", (2.6, -0.4, 0))
+    add("C-Line Trim (left)", cline_L, ALU, "The signature C-shaped line that wraps the side air intake.", (0, 0.4, 2.2), shine=0.6)
+    add("C-Line Trim (right)", cline_R, ALU, "The signature C-shaped line that wraps the side air intake.", (0, 0.4, -2.2), shine=0.6)
+    add("Side Intake (left)", intake_L, CARBON, "Feeds air to the side radiator and engine.", (0, -0.4, 1.8))
+    add("Side Intake (right)", intake_R, CARBON, "Feeds air to the side radiator and engine.", (0, -0.4, -1.8))
+    add("Side Radiators", side_rad, DARK, "Extra cooling for the engine, turbo and transmission.", (0, -0.9, 0))
+    add("Mirror (left)", mirror_L, CHIRON_BLUE, "Side mirror.", (0, 0.8, 1.5), shine=0.55)
+    add("Mirror (right)", mirror_R, CHIRON_BLUE, "Side mirror.", (0, 0.8, -1.5), shine=0.55)
+    add("LED Tail Light", tail, RED, "A single LED light bar across the whole tail.", (-2.8, 0.9, 0), shine=0.5)
+    add("Rear Diffuser", diffuser, CARBON, "Accelerates air under the car to add downforce and cut drag.", (-2.2, -1.0, 0))
+    add("Quad Exhaust", exhaust, STEEL, "Four tailpipes carrying exhaust from the engine.", (-3.2, -0.6, 0))
+    add("Rear Wing Struts", wing_struts, DARK, "Fixed supports for the active rear wing.", (-1.5, 1.2, 0))
+    add("Active Rear Wing", wing_blade, CARBON,
+        "Changes its angle for downforce, braking and top speed. Watch it tilt.", (-1.6, 2.4, 0),
+        pose=lambda t: (Rz(0.10 * math.sin(1.2 * t)), wing_pivot))
+    add("Carbon Monocoque", mono, CARBON, "The rigid carbon-fibre passenger cell that everything bolts to.", (0, -0.8, 0))
+    add("Carbon Seats", seats, DARK, "Two lightweight bucket seats.", (0.3, 1.9, 0))
+    add("Dashboard", dash, DARK, "Instrument panel and controls.", (1.0, 1.7, 0))
+    add("Steering Wheel", steering, STEEL, "Driver's steering input.", (1.3, 2.0, -0.4))
+    add("W16 Engine (8.0 L)", engine, STEEL,
+        "Quad-turbo 8.0 litre engine with sixteen cylinders in four banks, in a W layout.", (-1.5, -0.3, 0))
+    add("Crankshaft + Flywheel", crank, DARK, "Turns the pistons' push into rotation.", (-2.4, -0.3, 0),
+        pose=lambda t: (Rx(-t * 5.0), np.array([0.0, 0.40, 0.0])))
+    add("Turbochargers", turbos, COPPER, "Four turbos force extra air into the engine.", (-1.8, 0.9, 0))
+    add("Transaxle", gearbox, IRON, "Dual-clutch gearbox that sends power to all four wheels.", (-2.6, -0.9, 0))
+    add("Rear Axle + Differential", axle_r, STEEL, "Splits drive torque between the rear wheels.", (-0.8, -1.4, 0))
+    add("Front Axle", axle_f, STEEL, "Carries the front wheels and steering.", (1.2, -1.4, 0))
+
+    # ---------- wheels: tire, rim, brake disc, caliper at each corner ----------
+    def wheel_meshes(r_t, width):
+        tire = tube(r_t, r_t - 0.125, width, 26, axis="z")
+        spokes = [place(place(box(0.055, 0.17, 0.10), T=(0, 0.14, 0.03)), R=Rz(k * math.pi / 5)) for k in range(10)]
+        rim = merge(place(tube(0.255, 0.215, 0.20, 24, axis="z"), T=(0, 0, 0.0)),
+                    place(tube(0.07, 0, 0.22, 14, axis="z"), T=(0, 0, 0.03)), *spokes)
+        disc = place(tube(0.21, 0.08, 0.03, 24, axis="z"), T=(0, 0, -0.04))
+        caliper = place(box(0.16, 0.12, 0.08), T=(0, 0.18, -0.04))
+        return tire, rim, disc, caliper
+
+    for nm, ax, side, front in (("Front Left", FA, 1, True), ("Front Right", FA, -1, True),
+                                ("Rear Left", RA, 1, False), ("Rear Right", RA, -1, False)):
+        r_t, wd, track = (RF, 0.285, 0.86) if front else (RR, 0.355, 0.84)
+        c = np.array([ax, r_t, side * track])
+        tire, rim, disc, caliper = wheel_meshes(r_t, wd)
+        sx = 1.0 if ax > 0 else -1.0
+
+        def spin_pose(t, c=c, front=front):
+            R = (Ry(0.30 * math.sin(0.8 * t)) if front else I3) @ Rz(-t * 3.0)
+            return (R, c)
+
+        def steer_pose(t, c=c, front=front):
+            return ((Ry(0.30 * math.sin(0.8 * t)) if front else I3), c)
+
+        add(f"Tire {nm}", tire, DARK, "Rubber tire gripping the road.", (sx * 1.0, 0, side * 2.0), pose=spin_pose)
+        add(f"Rim {nm}", rim, ALU, "Alloy wheel the tire is mounted on.", (sx * 1.0, 0, side * 2.8), pose=spin_pose, shine=0.5)
+        add(f"Brake Disc {nm}", disc, IRON, "Carbon-ceramic disc that the caliper squeezes to slow the car.",
+            (sx * 1.0, 0, side * 1.2), pose=spin_pose)
+        add(f"Brake Caliper {nm}", caliper, RED, "Clamps the brake pads onto the spinning disc.",
+            (sx * 1.0, 0.6, side * 1.5), pose=steer_pose)
+
+    refine_parts(parts, 0.55)
+
+    def pose(t):
+        return [p(t) if p else (I3, Z3) for p in posers]
+
+    return Machine("Bugatti Chiron-style hypercar", parts, pose,
+                   "Monocoque, W16 engine, active wing (simplified, original model)", view=(-0.7, 0.22))
+
+
+def builtin_machines():
+    return [make_engine(), make_gearbox(), make_robot(), make_car(), make_chiron()]
+
+
+# ============================================================
+# Loading your own STL / OBJ / glTF models
 # ============================================================
 def load_stl(path):
     with open(path, "rb") as f:
@@ -1451,7 +2327,7 @@ def load_obj(path):
 _PALETTE = [STEEL, ORANGE, BLUE, GOLD, COPPER, ALU, RED, IRON]
 
 
-MAX_IMPORT_FACES = 9000        # keeps heavy CAD files interactive
+MAX_IMPORT_FACES = 16000       # keeps heavy models interactive (lower it on a slow PC)
 
 
 def decimate_mesh(mesh, target):
@@ -1466,6 +2342,7 @@ def decimate_mesh(mesh, target):
         q = np.floor((V - lo) / (ext / n)).astype(np.int64)
         K = n + 2
         uniq, inv = np.unique(q[:, 0] + q[:, 1] * K + q[:, 2] * K * K, return_inverse=True)
+        inv = inv.ravel()
         Fm = inv[F]
         keep = (Fm[:, 0] != Fm[:, 1]) & (Fm[:, 1] != Fm[:, 2]) & (Fm[:, 0] != Fm[:, 2])
         return len(uniq), inv, Fm[keep]
@@ -1487,17 +2364,163 @@ def decimate_mesh(mesh, target):
     return Vn[used], inv2.reshape(-1, 3)
 
 
+# ------------------------------------------------------------
+# glTF / GLB (the format most downloadable car models come in)
+# ------------------------------------------------------------
+_GL_DTYPE = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16,
+             5125: np.uint32, 5126: np.float32}
+_GL_NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+
+
+def _gl_read(path):
+    import base64
+    from urllib.parse import unquote
+    with open(path, "rb") as f:
+        data = f.read()
+    base = os.path.dirname(path)
+    bins, js = [], None
+    if data[:4] == b"glTF":                                   # binary .glb container
+        off = 12
+        while off + 8 <= len(data):
+            clen, ctype = struct.unpack("<II", data[off:off + 8])
+            chunk = data[off + 8:off + 8 + clen]
+            off += 8 + clen
+            if ctype == 0x4E4F534A:
+                js = json.loads(chunk.decode("utf-8"))
+            elif ctype == 0x004E4942:
+                bins.append(chunk)
+    else:
+        js = json.loads(data.decode("utf-8"))
+    if js is None:
+        raise ValueError("no JSON chunk found")
+    buffers = []
+    for b in js.get("buffers", []):
+        uri = b.get("uri")
+        if uri is None:
+            buffers.append(bins[0] if bins else b"")
+        elif uri.startswith("data:"):
+            buffers.append(base64.b64decode(uri.split(",", 1)[1]))
+        else:
+            with open(os.path.join(base, unquote(uri)), "rb") as f:
+                buffers.append(f.read())
+    return js, buffers
+
+
+def _gl_accessor(js, buffers, idx):
+    acc = js["accessors"][idx]
+    dt = np.dtype(_GL_DTYPE[acc["componentType"]])
+    nc = _GL_NCOMP[acc["type"]]
+    count = acc["count"]
+    if "bufferView" not in acc:
+        return np.zeros((count, nc), dt)
+    bv = js["bufferViews"][acc["bufferView"]]
+    off = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    stride = bv.get("byteStride") or nc * dt.itemsize
+    arr = np.ndarray((count, nc), dtype=dt, buffer=buffers[bv["buffer"]], offset=off,
+                     strides=(stride, dt.itemsize))
+    return np.array(arr)
+
+
+def _gl_node_matrix(n):
+    if "matrix" in n:
+        return np.array(n["matrix"], float).reshape(4, 4).T          # column-major
+    M = np.eye(4)
+    if "rotation" in n:
+        x, y, z, w = n["rotation"]
+        M[:3, :3] = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    if "scale" in n:
+        M[:3, :3] = M[:3, :3] @ np.diag(n["scale"])
+    if "translation" in n:
+        M[:3, 3] = n["translation"]
+    return M
+
+
+def load_gltf(path, max_parts=80):
+    """Returns [(name, V, F, color_bgr_or_None)]. glTF is Y-up, like this viewer."""
+    js, buffers = _gl_read(path)
+    nodes, mats = js.get("nodes", []), js.get("materials", [])
+
+    def mat_info(mi):
+        if mi is None or mi >= len(mats):
+            return None, "default"
+        m = mats[mi]
+        pbr = m.get("pbrMetallicRoughness", {})
+        f = np.array(pbr.get("baseColorFactor", [1, 1, 1, 1]), float)[:3]
+        if "baseColorTexture" in pbr and f.min() > 0.95:
+            return (170, 168, 165), m.get("name", f"material{mi}")       # texture only: neutral grey
+        c = (np.clip(f, 0, 1) ** (1 / 2.2) * 255)[::-1]                 # linear RGB -> sRGB BGR
+        return tuple(int(v) for v in c), m.get("name", f"material{mi}")
+
+    out = []
+
+    def visit(ni, parent):
+        n = nodes[ni]
+        M = parent @ _gl_node_matrix(n)
+        if "mesh" in n:
+            mesh = js["meshes"][n["mesh"]]
+            Vs, Fs, off, best = [], [], 0, (None, "default", -1)
+            for prim in mesh["primitives"]:
+                if prim.get("mode", 4) != 4 or "POSITION" not in prim["attributes"]:
+                    continue
+                P = _gl_accessor(js, buffers, prim["attributes"]["POSITION"]).astype(float)
+                if "indices" in prim:
+                    I = _gl_accessor(js, buffers, prim["indices"]).astype(np.int64).ravel()
+                else:
+                    I = np.arange(len(P))
+                F = I[:len(I) // 3 * 3].reshape(-1, 3)
+                if np.linalg.det(M[:3, :3]) < 0:
+                    F = F[:, [0, 2, 1]]
+                Vs.append(P @ M[:3, :3].T + M[:3, 3])
+                Fs.append(F + off)
+                off += len(P)
+                col, mname = mat_info(prim.get("material"))
+                if len(F) > best[2]:
+                    best = (col, mname, len(F))
+            if Vs:
+                name = n.get("name") or mesh.get("name") or f"part {len(out) + 1}"
+                out.append((name, np.vstack(Vs), np.vstack(Fs), best[0], best[1]))
+        for c in n.get("children", []):
+            visit(c, M)
+
+    if js.get("scenes"):
+        roots = js["scenes"][js.get("scene", 0)].get("nodes", [])
+    else:
+        # No scene list: start only from ROOT nodes, otherwise every child
+        # mesh would be visited twice (once directly, once via its parent).
+        children = {c for n in nodes for c in n.get("children", [])}
+        roots = [i for i in range(len(nodes)) if i not in children]
+    for r in roots:
+        visit(r, np.eye(4))
+
+    if len(out) > max_parts:                       # too many tiny parts: group them by material
+        groups = {}
+        for name, V, F, col, mname in out:
+            g = groups.setdefault(mname, [[], [], 0, col])
+            g[0].append(V)
+            g[1].append(F + g[2])
+            g[2] += len(V)
+        print(f"{os.path.basename(path)}: {len(out)} objects grouped into {len(groups)} materials")
+        return [(k, np.vstack(g[0]), np.vstack(g[1]), g[3]) for k, g in groups.items()]
+    return [(n, V, F, c) for n, V, F, c, _ in out]
+
+
 def load_machine_folder(folder, z_up=True):
-    raw = []
+    raw = []                                    # (name, V, F, color or None)
+    to_y_up = Rx(-math.pi / 2)
     for fn in sorted(os.listdir(folder)):
         path = os.path.join(folder, fn)
         ext = os.path.splitext(fn)[1].lower()
         try:
             if ext == ".stl":
                 V, F = load_stl(path)
-                raw.append((os.path.splitext(fn)[0], V, F))
+                raw.append((os.path.splitext(fn)[0], V @ to_y_up.T if z_up else V, F, None))
             elif ext == ".obj":
-                raw += load_obj(path)
+                raw += [(n, V @ to_y_up.T if z_up else V, F, None) for n, V, F in load_obj(path)]
+            elif ext in (".glb", ".gltf"):
+                raw += load_gltf(path)          # already Y-up
         except Exception as e:
             print(f"Could not load {path}: {e}")
     raw = [r for r in raw if len(r[1]) and len(r[2])]
@@ -1505,18 +2528,15 @@ def load_machine_folder(folder, z_up=True):
         return None
     total = sum(len(r[2]) for r in raw)
     if total > MAX_IMPORT_FACES:
-        raw = [(n, *decimate_mesh((V, F), max(150, int(MAX_IMPORT_FACES * len(F) / total))))
-               for n, V, F in raw]
+        raw = [(n, *decimate_mesh((V, F), max(150, int(MAX_IMPORT_FACES * len(F) / total))), c)
+               for n, V, F, c in raw]
         print(f"{os.path.basename(folder)}: simplified {total} -> {sum(len(r[2]) for r in raw)} triangles")
-    if z_up:                                   # CAD files are usually Z-up
-        R = Rx(-math.pi / 2)
-        raw = [(n, V @ R.T, F) for n, V, F in raw]
     allv = np.vstack([r[1] for r in raw])
     lo, hi = allv.min(0), allv.max(0)
     ctr = (lo + hi) / 2
     scale = 2.2 / max(float(np.linalg.norm(allv - ctr, axis=1).max()), 1e-9)
     parts = []
-    for i, (n, V, F) in enumerate(raw):
+    for i, (n, V, F, col) in enumerate(raw):
         V = (V - ctr) * scale
         V, F = refine_mesh((V, F), 0.5, max_iter=3)          # big flat faces sort badly otherwise
         pc = V.mean(0)
@@ -1528,7 +2548,7 @@ def load_machine_folder(folder, z_up=True):
         two_sided = abs(vol) < 0.05 * bbox
         if not two_sided and vol < 0:
             F = F[:, [0, 2, 1]]
-        parts.append(Part(n, (V, F), _PALETTE[i % len(_PALETTE)],
+        parts.append(Part(n, (V, F), col if col is not None else _PALETTE[i % len(_PALETTE)],
                           f"Imported part: {n}", d, two_sided=two_sided))
     return Machine(os.path.basename(folder.rstrip("/\\")), parts, None, "Imported model")
 
@@ -1540,7 +2560,11 @@ def load_machines(root, z_up=True):
     for name in sorted(os.listdir(root)):
         sub = os.path.join(root, name)
         if os.path.isdir(sub):
-            m = load_machine_folder(sub, z_up)
+            try:
+                m = load_machine_folder(sub, z_up)
+            except Exception as e:
+                print(f"Could not load machine folder '{name}': {e}")
+                continue
             if m:
                 out.append(m)
                 print(f"Loaded machine '{m.name}' with {len(m.parts)} parts")
@@ -1575,6 +2599,7 @@ class Explorer:
         self._dragging = False
         self._md = None
         self._mt = 0.0
+        self._mouse_t = -1e9              # last time the physical mouse moved over the viewer
         self._hand_t = 0.0
         self._fps = 30.0
 
@@ -1620,7 +2645,8 @@ class Explorer:
         self.isolate = False
         self.explode = 0.0
         self.explode_target = 0.0
-        self.yaw, self.pitch, self.zoom = 0.55, 0.30, 1.0
+        self.yaw, self.pitch = m.view
+        self.zoom = 1.0
         self.tgt = m.c0.copy()
         self.rad = m.r0
         self.pinch = None
@@ -1629,7 +2655,8 @@ class Explorer:
     def reset_view(self):
         self.sel, self.isolate = -1, False
         self.explode_target = 0.0
-        self.yaw, self.pitch, self.zoom = 0.55, 0.30, 1.0
+        self.yaw, self.pitch = self.machine.view
+        self.zoom = 1.0
         self.vyaw = self.vpitch = 0.0
         self._say("VIEW RESET")
 
@@ -1706,7 +2733,9 @@ class Explorer:
             return
         self.two_active = False
         if n == 0:
-            self.pointer = None
+            # keep the pointer if the physical mouse is driving the viewer
+            if now - self._mouse_t > 0.5:
+                self.pointer = None
             self._lost += 1
             self.gesture = ""
             if self._lost > 6:
@@ -1858,7 +2887,7 @@ class Explorer:
         self.pinch = None
         self._cand, self._cand_n = None, 0
 
-    # ---------- mouse (demo) ----------
+    # ---------- physical mouse (connected in main via cv2.setMouseCallback) ----------
     def on_mouse(self, event, x, y, flags, _):
         now = time.perf_counter()
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -1868,6 +2897,7 @@ class Explorer:
             self._mt = now
         elif event == cv2.EVENT_MOUSEMOVE:
             self.pointer = np.array([x, y], float)
+            self._mouse_t = now
             if self._dragging and self._md:
                 x0, y0, px, py = self._md
                 dyaw, dpit = (x - px) * 0.008, (y - py) * 0.008
@@ -2040,37 +3070,52 @@ class Explorer:
         roi[:] = (roi * (1 - alpha) + np.array([20, 16, 14]) * alpha).astype(np.uint8)
 
     def _labels(self, img, m, Vw, Rc, D, f, cx, cy, e):
-        """Part names with a dot on each part (shown once the model is exploded)."""
+        """Part names in two tidy side columns with leader lines (shown once the model is exploded).
+        If there are more parts than fit, the smallest ones are skipped - hover over them instead."""
         if not self.labels or e < 0.3:
             return
-        W = self.W
-        F, AA = cv2.FONT_HERSHEY_SIMPLEX, cv2.LINE_AA
+        W, H = self.W, self.H
+        FONT, AA = cv2.FONT_HERSHEY_SIMPLEX, cv2.LINE_AA
+        gap = 15
+        L_LO, L_HI, R_LO, R_HI = 92, H - 140, 160, H - 200       # keep clear of the HUD panels
+        cap_l, cap_r = (L_HI - L_LO) // gap + 1, (R_HI - R_LO) // gap + 1
         items = []
         for i, (s0, s1) in enumerate(m.vs):
             if self.isolate and self.sel >= 0 and i != self.sel:
                 continue
-            c = (Vw[s0:s1].mean(0) - self.tgt) @ Rc.T
+            pv = Vw[s0:s1]
+            ctr = pv.mean(0)
+            rad = float(np.linalg.norm(pv - ctr, axis=1).max())
+            c = (ctr - self.tgt) @ Rc.T
             c[2] -= D
             dep = -c[2]
             if dep < 0.3:
                 continue
             x, y = cx + f * c[0] / dep, cy - f * c[1] / dep
-            if 0 <= x < W and 0 <= y < self.H:
-                items.append((y, x, i))
-        items.sort()
-        last_y = -99.0
-        for y, x, i in items:
-            ty = max(y, last_y + 16)
-            last_y = ty
-            name = m.parts[i].name
-            tw = cv2.getTextSize(name, F, 0.42, 1)[0][0]
-            right = x + 16 + tw < W - 12
-            tx = x + 16 if right else x - 16 - tw
-            ax = x + 12 if right else x - 12
-            cv2.line(img, (int(x), int(y)), (int(ax), int(ty)), (210, 205, 200), 1, AA)
-            cv2.circle(img, (int(x), int(y)), 3, (255, 255, 255), -1, AA)
-            cv2.putText(img, name, (int(tx), int(ty) + 4), F, 0.42, (0, 0, 0), 3, AA)
-            cv2.putText(img, name, (int(tx), int(ty) + 4), F, 0.42, (240, 240, 240), 1, AA)
+            if 0 <= x < W and 0 <= y < H:
+                items.append([1e9 if i == self.sel else rad, x, y, i])
+        items.sort(key=lambda it: -it[0])
+        items = items[:cap_l + cap_r]
+        items.sort(key=lambda it: it[1])                          # left-to-right on screen
+        n_left = min(cap_l, max(round(len(items) * 0.55), len(items) - cap_r))
+        for group, lo, hi, side in ((items[:n_left], L_LO, L_HI, 0), (items[n_left:], R_LO, R_HI, 1)):
+            group.sort(key=lambda it: it[2])
+            ty = [min(max(it[2], lo), hi) for it in group]
+            for k in range(1, len(ty)):
+                ty[k] = max(ty[k], ty[k - 1] + gap)
+            if ty and ty[-1] > hi:
+                ty[-1] = hi
+                for k in range(len(ty) - 2, -1, -1):
+                    ty[k] = min(ty[k], ty[k + 1] - gap)
+            for it, t in zip(group, ty):
+                name = m.parts[it[3]].name
+                tw = cv2.getTextSize(name, FONT, 0.40, 1)[0][0]
+                tx = 16 if side == 0 else W - 16 - tw
+                ax = tx + tw + 5 if side == 0 else tx - 5
+                cv2.line(img, (int(it[1]), int(it[2])), (int(ax), int(t)), (200, 196, 190), 1, AA)
+                cv2.circle(img, (int(it[1]), int(it[2])), 3, (255, 255, 255), -1, AA)
+                cv2.putText(img, name, (tx, int(t) + 4), FONT, 0.40, (0, 0, 0), 3, AA)
+                cv2.putText(img, name, (tx, int(t) + 4), FONT, 0.40, (240, 240, 240), 1, AA)
 
     def _hud(self, img, m, e, preview):
         W, H = self.W, self.H
@@ -2120,7 +3165,7 @@ class Explorer:
                       "THUMB+MIDDLE tap: SELECT part        THUMB+PINKY tap: ISOLATE / SHOW ALL",
                       "TWO HANDS apart / together: EXPLODE   FIST 1s: RESET   PALM swipe: NEXT MACHINE",
                       "Keys: E exit 3D  N/B machine  Space animate  X explode  I isolate  Tab part",
-                      "      T auto-rotate  L labels  G quality  H hide this help"]
+                      "      T auto-rotate  L labels  G quality  H hide help   Mouse: drag/click/wheel"]
             for i, ln in enumerate(legend):
                 cv2.putText(img, ln, (20, H - 108 + 19 * i), F, 0.4, (200, 196, 190), 1, AA)
         else:
@@ -2144,7 +3189,6 @@ class Explorer:
             cv2.rectangle(img, (W - pw - 10, H - ph - 10), (W - 10, H - 10), (200, 200, 200), 1)
 
 
-
 # ============================================================
 # Setup helpers
 # ============================================================
@@ -2152,10 +3196,19 @@ def ensure_model():
     if os.path.exists(MODEL_PATH):
         return
     print(f"{MODEL_PATH} not found, downloading...")
+    tmp = MODEL_PATH + ".part"
     try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        urllib.request.urlretrieve(MODEL_URL, tmp)
+        if os.path.getsize(tmp) < 1_000_000:          # the real model is several MB
+            raise ValueError("downloaded file is too small - probably an error page")
+        os.replace(tmp, MODEL_PATH)                   # only appears once it is complete
     except Exception as e:
-        print(f"Download failed: {e}\nDownload it manually from:\n{MODEL_URL}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print(f"Download failed: {e}\nDownload it manually from:\n{MODEL_URL}\n"
+              f"and put it here: {MODEL_PATH}")
         sys.exit(1)
 
 
@@ -2170,7 +3223,16 @@ def open_camera(cfg):
     return cap
 
 
+def window_closed(window):
+    """True if the user closed the window with its X button."""
+    try:
+        return cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
 def main():
+    setup_logging()
     cfg = Config()
     load_calibration(cfg)
     ensure_model()
@@ -2190,12 +3252,15 @@ def main():
 
     cap = open_camera(cfg)
     if not cap.isOpened():
-        print("ERROR: could not open the camera.")
+        print("ERROR: could not open the camera. Is another app using it?")
+        detector.close()
         return
 
     ok, frame = cap.read()
     if not ok:
         print("ERROR: camera returned no frames.")
+        cap.release()
+        detector.close()
         return
     h, w = frame.shape[:2]
     am = AirMouse(cfg, w, h)
@@ -2210,12 +3275,25 @@ def main():
     fx_mode = False
     two_hands_n = 0
     calib = Calibrator()
+    gestures = GestureStore(GESTURES_PATH)
+    recorder = GestureRecorder(gestures)
+    am.gestures = gestures
+    os.makedirs(cfg.machines_dir, exist_ok=True)   # so users can see where models go
     explorer = Explorer(cfg, builtin_machines() + load_machines(cfg.machines_dir, cfg.models_z_up))
     explore_mode = False           # 3D machine explorer mode (E), toggled just like FX mode (F)
+
+    # The physical mouse drives the 3D viewer (drag = rotate, click = select, wheel = zoom).
+    def on_mouse(event, x, y, flags, param):
+        if explore_mode:
+            explorer.on_mouse(event, x, y, flags, param)
+    cv2.setMouseCallback(window, on_mouse)
+
+    hotkey = GlobalHotkey(cfg.global_pause_hotkey)
 
     t0 = time.perf_counter()
     last_ts = -1
     fps, fps_n, fps_t = 0.0, 0, time.perf_counter()
+    read_failures = 0
 
     print(__doc__)
 
@@ -2223,9 +3301,22 @@ def main():
         while True:
             ok, frame = cap.read()
             if not ok:
-                break
+                # Webcams hiccup (USB glitches, power saving). Don't quit on one bad frame.
+                read_failures += 1
+                am.on_no_hand()
+                am.tick(time.perf_counter())
+                if read_failures >= cfg.max_read_failures:
+                    print("ERROR: the camera stopped sending frames. Exiting.")
+                    break
+                if cv2.waitKey(30) & 0xFF == ord("q") or window_closed(window):
+                    break
+                continue
+            read_failures = 0
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
+
+            if hotkey.poll():
+                am.toggle_pause()
 
             now = time.perf_counter()
             ts = int((now - t0) * 1000)
@@ -2248,6 +3339,16 @@ def main():
                     draw_hand(frame, hl, w, h, cfg.pointer_landmark)
                 am.status = "3D EXPLORER"
                 explorer.update(hands, w, h, now)
+
+            elif recorder.active:
+                # ---- Recording a custom gesture: mouse control is off ----
+                rl = hands[0] if hands else None
+                if rl is not None:
+                    draw_hand(frame, rl, w, h, cfg.pointer_landmark)
+                am.release_all()
+                am.reset_filters()
+                am.status = "RECORDING GESTURE"
+                recorder.update(rl, w, h, now, cfg)
 
             elif calib.active:
                 # ---- Calibration: mouse control is off while we measure ----
@@ -2279,11 +3380,13 @@ def main():
             elif hands:
                 mouse_lm = fx_lm = None
                 if fx_mode:
+                    # Assign hands by MediaPipe's label. A hand with neither label
+                    # (or a missing label) falls back to being the mouse hand.
                     for i, lm in enumerate(hands):
                         label = labels[i] if i < len(labels) else ""
                         if label == cfg.fx_hand_label:
                             fx_lm = lm
-                        else:
+                        elif label == cfg.mouse_hand_label or mouse_lm is None:
                             mouse_lm = lm
                 else:
                     mouse_lm = hands[0]
@@ -2320,16 +3423,18 @@ def main():
             else:
                 draw_hud(frame, am, fps, fx_mode)
                 draw_calibration(frame, calib, now)
+                draw_recorder(frame, recorder, now)
                 cv2.imshow(window, frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key == ord("q") or window_closed(window):
                 break
             if key == ord("e"):
                 explore_mode = not explore_mode
                 explorer.active = explore_mode
                 if calib.active:
                     calib.cancel(time.perf_counter())
+                recorder.cancel(time.perf_counter())
                 two_hands_n = 0
                 am.release_all()
                 am.reset_filters()
@@ -2340,6 +3445,21 @@ def main():
                 if key != 255:
                     explorer.key(key)          # in 3D mode the other keys control the viewer
                 continue
+            if recorder.active:
+                # while recording, keys only pick an action or cancel
+                if key == 27 or key == ord("g"):
+                    recorder.cancel(time.perf_counter())
+                elif recorder.choosing and key != 255:
+                    recorder.choose(key, time.perf_counter())
+                continue
+            if key == ord("g") and not calib.active:
+                am.release_all()
+                recorder.start(time.perf_counter())
+                continue
+            if key == ord("u"):
+                g = gestures.remove_last()
+                recorder._say(f"Removed gesture '{g.name}' ({len(gestures.items)} left)" if g
+                              else "No custom gestures to remove", time.perf_counter())
             if key == ord("p"):
                 am.toggle_pause()
             if key == ord("d"):
@@ -2371,6 +3491,7 @@ def main():
     finally:
         pyautogui.FAILSAFE = False  # so cleanup can't raise again
         am.release_all()
+        hotkey.stop()
         detector.close()
         rasengan.release()
         cinema.release()
