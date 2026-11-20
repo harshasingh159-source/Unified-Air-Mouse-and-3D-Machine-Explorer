@@ -32,6 +32,16 @@ python main.py
 The hand-tracking model (`hand_landmarker.task`) is included in the repo. If it is missing,
 the program downloads it on first run.
 
+### First launch: the tutorial
+
+The first time you open the app, a short interactive tutorial starts. It walks through
+calibration and every gesture (move, click, right click, drag, scroll, freeze, two-hand zoom
+and Alt+Tab) on a **practice board** drawn over the camera view. During the tutorial, gestures
+move a virtual cursor only, so nothing on your real desktop gets clicked.
+
+- `SPACE` skips a lesson, and `Esc` exits the tutorial.
+- Press `T` any time to replay it.
+
 > **Emergency stop:** push your physical mouse into any screen corner. The PyAutoGUI
 > fail-safe quits the program and releases all buttons.
 
@@ -42,10 +52,10 @@ the program downloads it on first run.
 | Action | Gesture |
 |---|---|
 | Move cursor | Point. The cursor follows your **index fingertip** |
-| Left click | Pinch **thumb + ring finger** and release |
-| Drag | Hold the thumb + ring pinch for 0.25 s, move, then open to drop |
-| Right click | Pinch **thumb + pinky** |
-| Scroll | **OK sign** (thumb + index pinched, other fingers up), then move your hand up/down |
+| Left click | Quick **tap**: touch **thumb + index** fingertips and let go |
+| Right click | Pinch **thumb + middle finger** |
+| Drag | Pinch **thumb + ring finger** and hold, move, then open your fingers to drop |
+| Scroll | **OK sign** (thumb + index pinched, other fingers up), hold it for about 0.3 s, then move your hand up/down |
 | Freeze cursor | Make a tight **fist** |
 | Alt+Tab | **Open palm**, then swipe right/left to cycle windows. Close your hand to pick one |
 | Zoom | **Two hands**: pinch **thumb + index** on both, then spread apart = zoom in, bring together = zoom out |
@@ -54,7 +64,7 @@ Zoom sends Ctrl+mouse wheel to the window under the cursor, so point at what you
 first. It works in browsers, maps, image viewers and Office. Press `Z` to turn it on or off.
 It is off in FX mode, where two hands trigger Absolute Cinema.
 
-**Calibrate** with `C`: pinch ring, pinky and index when asked. Your personal thresholds are saved
+**Calibrate** with `C`: touch your thumb to your index, middle and ring fingertips when asked. Your personal thresholds are saved
 to `air_mouse_calibration.json`.
 
 ## Custom gestures
@@ -118,6 +128,7 @@ Textures are not shown.
 | `P` | Pause | `U` | Remove last gesture |
 | `D` | Debug overlay | `Q` | Quit |
 | `C` | Calibrate (`Esc` cancels) | `Z` | Two-hand zoom on/off |
+| `T` | Replay the tutorial | | |
 
 **Global pause:** `Ctrl+Alt+P` works from any window (needs `pynput`).
 
@@ -147,4 +158,5 @@ Calibration, custom gestures and the `machines/` folder are also stored next to 
 | `rasengan.mp4`, `absolute_cinema.mp4` | FX mode videos |
 | `air_mouse_calibration.json` | Your calibration thresholds (created when you calibrate, not in git) |
 | `custom_gestures.json` | Your recorded gestures (created when you record one, not in git) |
+| `air_mouse_settings.json` | Remembers that the tutorial was shown (created by the app, not in git) |
 | `requirements.txt` | Python dependencies |

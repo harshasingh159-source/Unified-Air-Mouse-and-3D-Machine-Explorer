@@ -9,11 +9,11 @@ MODES  (toggle with a key; the default mode is the air mouse)
 
 AIR MOUSE (default)  -- any one hand:
   Move cursor ........ point; the cursor follows your index FINGERTIP
-  Left click ......... pinch thumb + RING finger and release (a real click)
-  Drag ............... keep the thumb + ring pinch held for 0.25s, move, open to drop
-  Right click ........ pinch thumb + PINKY finger
+  Left click ......... quick TAP: touch thumb + INDEX fingertips and let go
+  Right click ........ pinch thumb + MIDDLE finger
+  Drag ............... pinch thumb + RING finger and HOLD, move, open to drop
   Scroll ............. OK sign (thumb + index pinched, middle/ring/pinky up),
-                       then move your hand UP/DOWN
+                       HOLD it ~0.3s, then move your hand UP/DOWN
   Freeze (clutch) .... make a tight fist -> cursor stops
   Alt+Tab ............ OPEN PALM (all 4 fingers up; the cursor freezes), then
                        swipe RIGHT = next window, LEFT = previous window.
@@ -22,7 +22,7 @@ AIR MOUSE (default)  -- any one hand:
   Zoom ............... TWO HANDS: pinch thumb + index on both, then spread
                        apart = zoom in, bring together = zoom out (Ctrl+wheel
                        on the window under the cursor; Z turns it on/off)
-  Calibrate .......... press C: pinch ring, pinky, index when asked. Your
+  Calibrate .......... press C: pinch index, middle, ring when asked. Your
                        personal thresholds are measured and saved to a file.
 
 CUSTOM GESTURES (air mouse and FX mode):
@@ -62,6 +62,7 @@ FX MODE (F):
 Keys (camera window focused):
   F fx mode   E 3D explorer   P pause   D debug   C calibrate (Esc cancels)
   S swipe on/off   Z two-hand zoom on/off   G record gesture   U remove last gesture
+  T tutorial (runs by itself on first launch; SPACE skips a lesson, Esc exits)
   Q quit (or close the window)
 GLOBAL PAUSE: Ctrl+Alt+P works from ANY window (needs: pip install pynput)
 EMERGENCY STOP: slam your physical mouse into any screen corner
@@ -168,16 +169,21 @@ class Config:
 
     # Pinch distances are divided by hand size (wrist -> middle knuckle).
     # "close" = pinch registers, "open" = pinch releases (the gap stops flicker).
-    # Read the T-I / T-R / T-P numbers in the debug line while you pinch, and
+    # Read the T-I / T-M / T-R numbers in the debug line while you pinch, and
     # set "close" just above what you see (and well below your resting value).
-    pinch_close: float = 0.45          # LEFT click  : thumb-ring
-    pinch_open: float = 0.70
-    right_pinch_close: float = 0.55    # RIGHT click : thumb-pinky
-    right_pinch_open: float = 0.85
-    scroll_pinch_close: float = 0.40   # SCROLL sign : thumb-index
+    # Calibration (C) measures these for you.
+    scroll_pinch_close: float = 0.40   # LEFT click (quick tap) / SCROLL (OK sign held): thumb-index
     scroll_pinch_open: float = 0.60
+    right_pinch_close: float = 0.45    # RIGHT click : thumb-middle
+    right_pinch_open: float = 0.70
+    pinch_close: float = 0.45          # DRAG (hold) : thumb-ring
+    pinch_open: float = 0.70
     click_confirm_frames: int = 2      # frames a pinch must persist to count
-    drag_hold_s: float = 0.25          # hold a left pinch this long to start a drag
+    tap_max_s: float = 0.6             # thumb-index pinch released within this = left click
+    release_margin: float = 0.30       # a held pinch lets go once the gap opens this much
+                                       # past its tightest point (even if "open" isn't reached)
+    pinch_rewind_s: float = 0.12       # click where the cursor was this long before the pinch
+                                       # (pinching pulls the fingertip, so the cursor drifts)
 
     # Fist = ALL four fingertips closer to the wrist than this * hand size.
     fist_tip_ratio: float = 1.1
@@ -186,7 +192,8 @@ class Config:
     extend_ratio: float = 1.2
     pose_confirm_frames: int = 3     # frames a pose must persist to switch mode
 
-    scroll_confirm_frames: int = 3   # frames the OK sign must be held to scroll
+    scroll_hold_s: float = 0.30      # hold the OK sign this long before it scrolls
+                                     # (a shorter thumb-index pinch is a left click)
     scroll_gain: float = 1500.0      # larger = faster scrolling
     scroll_deadzone: float = 0.003   # ignore tiny hand jitter (frame fraction)
 
@@ -307,6 +314,18 @@ def open_youtube_in_chrome(url):
 CALIB_PATH = os.path.join(app_dir(), "air_mouse_calibration.json")
 CALIB_KEYS = ("pinch_close", "pinch_open", "right_pinch_close", "right_pinch_open",
               "scroll_pinch_close", "scroll_pinch_open")
+CALIB_VERSION = 2      # v2: index = click/scroll, middle = right click, ring = drag
+
+# Fingertips touching gives a ratio of about 0.1-0.4. A "close" threshold above
+# PINCH_MAX would fire on a relaxed hand, so such values are never used.
+PINCH_MIN, PINCH_MAX, OPEN_MAX = 0.20, 0.65, 0.95
+
+
+def sane_thresholds(close, open_):
+    """Clamp a (close, open) pair into a range that can't trigger on a relaxed hand."""
+    close = min(max(close, PINCH_MIN), PINCH_MAX)
+    open_ = min(max(open_, close + 0.10), OPEN_MAX)
+    return round(close, 3), round(open_, 3)
 
 
 def load_calibration(cfg):
@@ -318,38 +337,47 @@ def load_calibration(cfg):
     except Exception as e:
         print(f"Could not read {CALIB_PATH}: {e}")
         return False
-    for k in CALIB_KEYS:
-        if k in data:
-            setattr(cfg, k, float(data[k]))
+    if data.get("version") != CALIB_VERSION:
+        print("Calibration file is from an older version (different fingers) - ignored. "
+              "Press C to calibrate again.")
+        return False
+    for kc, ko in (("pinch_close", "pinch_open"), ("right_pinch_close", "right_pinch_open"),
+                   ("scroll_pinch_close", "scroll_pinch_open")):
+        if kc in data and ko in data:
+            c, o = sane_thresholds(float(data[kc]), float(data[ko]))
+            setattr(cfg, kc, c)
+            setattr(cfg, ko, o)
     print(f"Loaded calibration from {CALIB_PATH}")
     return True
 
 
 def save_calibration(cfg):
     try:
+        data = {"version": CALIB_VERSION}
+        data.update({k: getattr(cfg, k) for k in CALIB_KEYS})
         with open(CALIB_PATH, "w") as f:
-            json.dump({k: getattr(cfg, k) for k in CALIB_KEYS}, f, indent=2)
+            json.dump(data, f, indent=2)
         print(f"Calibration saved to {CALIB_PATH}")
     except Exception as e:
         print(f"Could not save calibration: {e}")
 
 
 def hand_ratios(landmarks, w, h):
-    """(thumb-index, thumb-ring, thumb-pinky), each divided by hand size."""
+    """(thumb-index, thumb-middle, thumb-ring), each divided by hand size."""
     pts = np.array([[l.x * w, l.y * h] for l in landmarks])
     scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
     t = pts[4]
     return (np.linalg.norm(t - pts[8]) / scale,
-            np.linalg.norm(t - pts[16]) / scale,
-            np.linalg.norm(t - pts[20]) / scale)
+            np.linalg.norm(t - pts[12]) / scale,
+            np.linalg.norm(t - pts[16]) / scale)
 
 
 class Calibrator:
     STEPS = [
         ("REST", "Relax your hand and POINT with your index finger"),
-        ("RING", "PINCH thumb + RING finger and hold"),
-        ("PINKY", "PINCH thumb + PINKY finger and hold"),
-        ("INDEX", "OK SIGN: pinch thumb + INDEX, other 3 fingers up"),
+        ("INDEX", "TOUCH thumb tip to INDEX fingertip and hold (left click)"),
+        ("MIDDLE", "TOUCH thumb tip to MIDDLE fingertip and hold (right click)"),
+        ("RING", "TOUCH thumb tip to RING fingertip and hold (drag)"),
     ]
     PREP_S = 2.5        # time to get into the pose
     CAPTURE_S = 2.0     # time spent measuring
@@ -392,7 +420,7 @@ class Calibrator:
     def update(self, ratios, now):
         """Feed one frame. Returns a dict of new thresholds when finished, else None."""
         if ratios is not None:
-            self.live = f"T-I {ratios[0]:.2f}  T-R {ratios[1]:.2f}  T-P {ratios[2]:.2f}"
+            self.live = f"T-I {ratios[0]:.2f}  T-M {ratios[1]:.2f}  T-R {ratios[2]:.2f}"
         else:
             self.live = "no hand seen"
         el = now - self.t0
@@ -418,17 +446,22 @@ class Calibrator:
     @staticmethod
     def _thresholds(pinched, rest):
         span = rest - pinched
-        if span < 0.15:          # pinch isn't clearly different from resting
+        if pinched > PINCH_MAX or span < 0.15:   # fingers weren't really touching
             return None
-        return pinched + 0.40 * span, pinched + 0.70 * span
+        close = pinched + 0.40 * span
+        open_ = pinched + 0.70 * span
+        if close > PINCH_MAX:                    # never fire on a relaxed hand
+            close = max(pinched + 0.05, min(close, PINCH_MAX))
+            open_ = min(open_, close + 0.25)
+        return sane_thresholds(close, open_)
 
     def _finish(self, now):
         self.active = False
         rest = self.med["REST"]
         specs = [
-            ("ring", "pinch_close", "pinch_open", self.med["RING"][1], rest[1]),
-            ("pinky", "right_pinch_close", "right_pinch_open", self.med["PINKY"][2], rest[2]),
             ("index", "scroll_pinch_close", "scroll_pinch_open", self.med["INDEX"][0], rest[0]),
+            ("middle", "right_pinch_close", "right_pinch_open", self.med["MIDDLE"][1], rest[1]),
+            ("ring", "pinch_close", "pinch_open", self.med["RING"][2], rest[2]),
         ]
         out, good, bad = {}, [], []
         for name, kc, ko, pinched, resting in specs:
@@ -596,11 +629,11 @@ def shape_distance(a, b):
 def looks_like_click(ratios, fingers, cfg):
     """True if this hand would trigger a built-in click, right click or scroll
     (the same rules AirMouse.on_hand uses)."""
-    ti, tr, tp = ratios
+    ti, tm, tr = ratios
     index, middle, ring, pinky = fingers
-    return ((not ring and tr < cfg.pinch_close and tr <= tp)              # left click
-            or (not pinky and tp < cfg.right_pinch_close and tp < tr)     # right click
-            or (ti < cfg.scroll_pinch_close and middle and ring and pinky))  # scroll (OK sign)
+    return (ti < cfg.scroll_pinch_close                                    # left click / scroll
+            or (not middle and tm < cfg.right_pinch_close and tm < tr)     # right click
+            or (not ring and tr < cfg.pinch_close and tr <= tm))           # drag
 
 
 class CustomGesture:
@@ -829,11 +862,101 @@ class OneEuro:
 
 
 # ============================================================
+# Where gestures send their mouse / keyboard actions.
+#   DesktopOutput  -> the real mouse and keyboard (normal use)
+#   PracticeOutput -> a virtual cursor on the tutorial's practice board
+# ============================================================
+class DesktopOutput:
+    practice = False
+
+    def moveTo(self, x, y):
+        pyautogui.moveTo(x, y)
+
+    def click(self):
+        pyautogui.click()
+
+    def mouseDown(self):
+        pyautogui.mouseDown()
+
+    def mouseUp(self):
+        pyautogui.mouseUp()
+
+    def rightClick(self):
+        pyautogui.rightClick()
+
+    def scroll(self, n):
+        pyautogui.scroll(n)
+
+    def keyDown(self, key):
+        pyautogui.keyDown(key)
+
+    def keyUp(self, key):
+        pyautogui.keyUp(key)
+
+    def press(self, key):
+        pyautogui.press(key)
+
+
+DESKTOP = DesktopOutput()
+
+
+class PracticeOutput:
+    """Records what the gestures WOULD do, so the tutorial can check it.
+    Nothing reaches the real desktop. Positions are in screen pixels."""
+    practice = True
+
+    def __init__(self, screen_w, screen_h):
+        self.sw, self.sh = screen_w, screen_h
+        self.x, self.y = screen_w / 2, screen_h / 2
+        self.down = False
+        self.held = set()
+        self.events = []           # (kind, value, x, y)
+
+    def _ev(self, kind, value=0):
+        self.events.append((kind, value, self.x, self.y))
+
+    def take_events(self):
+        ev, self.events = self.events, []
+        return ev
+
+    def moveTo(self, x, y):
+        self.x, self.y = x, y
+
+    def click(self):
+        self._ev("click")
+
+    def mouseDown(self):
+        self.down = True
+        self._ev("down")
+
+    def mouseUp(self):
+        self.down = False
+        self._ev("up")
+
+    def rightClick(self):
+        self._ev("right")
+
+    def scroll(self, n):
+        self._ev("zoom" if ({"ctrl", "command"} & self.held) else "scroll", n)
+
+    def keyDown(self, key):
+        self.held.add(key)
+
+    def keyUp(self, key):
+        self.held.discard(key)
+
+    def press(self, key):
+        if key == "tab" and ({"alt", "command"} & self.held):
+            self._ev("alttab", -1 if "shift" in self.held else 1)
+
+
+# ============================================================
 # Core controller
 # ============================================================
 class AirMouse:
     def __init__(self, cfg, frame_w, frame_h):
         self.cfg = cfg
+        self.out = DESKTOP         # swapped for a PracticeOutput during the tutorial
         self.sw, self.sh = pyautogui.size()
 
         # Active region with the same aspect ratio as the screen.
@@ -858,22 +981,29 @@ class AirMouse:
         self._cand = "NONE"
         self._cand_n = 0
 
-        self.left_down = False
-        self.left_pending = False   # pinch seen: release = click, hold = drag
-        self.left_pending_t = 0.0
-        self.left_n = 0
-        self.right_latched = False
-        self.right_n = 0
-
-        self.debug = True
-        self.dbg = ""
-
-        # OK sign (scroll)
-        self.ok_n = 0
-        self.ok_miss = 0
+        # Thumb + INDEX: quick tap = left click, OK sign held = scroll
+        self.idx_n = 0
+        self.idx_pending = False    # pinch in progress (not yet a click or a scroll)
+        self.idx_t = 0.0
+        self.idx_miss = 0
         self.scrolling = False
         self.scroll_y = None
         self.scroll_acc = 0.0
+        # Thumb + RING held = drag
+        self.left_down = False
+        self.ring_n = 0
+        self.ring_min = 9.0
+        # Thumb + MIDDLE = right click (once per pinch)
+        self.right_latched = False
+        self.right_n = 0
+        self.mid_min = 9.0
+        # A pinch only counts after its fingers were seen OPEN (stops a relaxed,
+        # curled hand from clicking the moment it appears).
+        self.armed = {"idx": False, "mid": False, "ring": False}
+        self.cur_hist = deque(maxlen=30)   # (t, sx, sy) recent cursor positions
+
+        self.debug = True
+        self.dbg = ""
 
         # Peace sign macro
         self.peace_start = None
@@ -907,14 +1037,15 @@ class AirMouse:
     # ---------- state helpers ----------
     def release_all(self):
         if self.left_down:
-            pyautogui.mouseUp()
+            self.out.mouseUp()
         self.left_down = False
-        self.left_pending = False
-        self.left_n = 0
+        self.ring_n = 0
         self.right_latched = False
         self.right_n = 0
-        self.ok_n = 0
-        self.ok_miss = 0
+        self.idx_n = 0
+        self.idx_pending = False
+        self.idx_miss = 0
+        self.armed = {"idx": False, "mid": False, "ring": False}
         self.scrolling = False
         self.scroll_y = None
         self.scroll_acc = 0.0
@@ -974,22 +1105,40 @@ class AirMouse:
         sy = m + v * (self.sh - 1 - 2 * m)
         return int(sx), int(sy)
 
+    def _disarm(self):
+        """After any click / drop: every pinch must open again before it can fire,
+        so the thumb sliding past another finger on the way out can't click."""
+        self.armed = {"idx": False, "mid": False, "ring": False}
+
+    def _rewind(self, now):
+        """Pinching pulls the fingertip (and the cursor) a little. Put the cursor
+        back where it was just before the pinch, so the click lands on target."""
+        target = None
+        for t, sx, sy in self.cur_hist:
+            if t <= now - self.cfg.pinch_rewind_s:
+                target = (sx, sy)
+            else:
+                break
+        if target is not None:
+            self.out.moveTo(*target)
+        self.cur_hist.clear()
+
     # ---------- Alt+Tab swipe ----------
     def _release_alt(self):
         if self.alt_down:
-            pyautogui.keyUp(self.mod)
+            self.out.keyUp(self.mod)
             self.alt_down = False
 
     def _alt_tab(self, direction, now):
         if not self.alt_down:
-            pyautogui.keyDown(self.mod)       # hold Alt: the window switcher stays open
+            self.out.keyDown(self.mod)       # hold Alt: the window switcher stays open
             self.alt_down = True
         if direction < 0:
-            pyautogui.keyDown("shift")        # Shift+Tab = move left
-            pyautogui.press("tab")
-            pyautogui.keyUp("shift")
+            self.out.keyDown("shift")        # Shift+Tab = move left
+            self.out.press("tab")
+            self.out.keyUp("shift")
         else:
-            pyautogui.press("tab")            # Tab = move right
+            self.out.press("tab")            # Tab = move right
         self.alt_last = now
         self.flash_text = "ALT-TAB  <<" if direction < 0 else "ALT-TAB  >>"
         self.flash_until = now + 0.6
@@ -1041,8 +1190,9 @@ class AirMouse:
         cfg = self.cfg
         g = None
         if (self.gestures is not None and self.gestures.items and raw != "PALM"
-                and not click_like and not self.left_down and not self.left_pending
-                and not self.right_latched and self.ok_n == 0):
+                and not self.out.practice          # no custom actions during the tutorial
+                and not click_like and not self.left_down and not self.idx_pending
+                and not self.right_latched):
             g, _ = self.gestures.match(pts, pattern, cfg.gesture_match_dist)
         if g is not None:
             self.cg_miss = 0
@@ -1069,9 +1219,9 @@ class AirMouse:
         pts = np.array([[lm.x * w, lm.y * h] for lm in landmarks])
         scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6  # wrist -> middle knuckle
         thumb = pts[4]
-        idx_ratio = np.linalg.norm(thumb - pts[8]) / scale     # thumb-index : OK sign (scroll)
-        ring_ratio = np.linalg.norm(thumb - pts[16]) / scale   # thumb-ring  : left click
-        pinky_ratio = np.linalg.norm(thumb - pts[20]) / scale  # thumb-pinky : right click
+        idx_ratio = np.linalg.norm(thumb - pts[8]) / scale     # thumb-index : left click / scroll
+        mid_ratio = np.linalg.norm(thumb - pts[12]) / scale    # thumb-middle: right click
+        ring_ratio = np.linalg.norm(thumb - pts[16]) / scale   # thumb-ring  : drag
         spread = np.linalg.norm(pts[8] - pts[12]) / scale      # index-middle gap
 
         index, middle, ring, pinky = self._fingers(pts)
@@ -1081,17 +1231,25 @@ class AirMouse:
                     for t in (8, 12, 16, 20))
         # Open palm: all four fingers up and NOT pinching anything.
         all_up = index and middle and ring and pinky
-        pinching_any = (idx_ratio < cfg.scroll_pinch_close or ring_ratio < cfg.pinch_close
-                        or pinky_ratio < cfg.right_pinch_close)
+        pinching_any = (idx_ratio < cfg.scroll_pinch_close or mid_ratio < cfg.right_pinch_close
+                        or ring_ratio < cfg.pinch_close)
         if tight:
             raw = "FIST"
-        elif (self.swipe_enabled and all_up and not pinching_any and self.ok_n == 0
-              and not self.left_pending and not self.left_down):
+        elif (self.swipe_enabled and all_up and not pinching_any
+              and not self.idx_pending and not self.left_down):
             raw = "PALM"
         else:
             raw = "POINT"
-        self.dbg = (f"T-I{idx_ratio:.2f} T-R{ring_ratio:.2f} T-P{pinky_ratio:.2f} "
+        self.dbg = (f"T-I{idx_ratio:.2f} T-M{mid_ratio:.2f} T-R{ring_ratio:.2f} "
                     f"fing {int(index)}{int(middle)}{int(ring)}{int(pinky)} {raw}")
+
+        # Arm each pinch once its fingers have been seen open.
+        if idx_ratio > cfg.scroll_pinch_open:
+            self.armed["idx"] = True
+        if mid_ratio > cfg.right_pinch_open:
+            self.armed["mid"] = True
+        if ring_ratio > cfg.pinch_open:
+            self.armed["ring"] = True
 
         # Debounced pose (FIST freezes the cursor).
         if raw == self._cand:
@@ -1112,7 +1270,7 @@ class AirMouse:
                 self._release_alt()       # hand closed: pick the highlighted window
 
         # ---------- Custom gestures (recorded with G) ----------
-        click_like = looks_like_click((idx_ratio, ring_ratio, pinky_ratio), (index, middle, ring, pinky), cfg)
+        click_like = looks_like_click((idx_ratio, mid_ratio, ring_ratio), (index, middle, ring, pinky), cfg)
         custom_active = self._custom_gesture(pts, (index, middle, ring, pinky), raw, click_like, now)
 
         # ---------- Peace sign -> YouTube (FX mode only) ----------
@@ -1136,68 +1294,81 @@ class AirMouse:
                 self.peace_armed = True
                 self.peace_miss = 0
 
-        # ---------- OK sign (thumb-index) -> scroll ----------
-        # Left click uses the RING finger now, so this sign never clashes with it.
-        thr = cfg.scroll_pinch_open if self.ok_n > 0 else cfg.scroll_pinch_close
-        ok_shape = (not self.left_down and raw != "FIST" and idx_ratio < thr
-                    and middle and ring and pinky)
-        if ok_shape:
-            self.ok_miss = 0
-            self.ok_n += 1
-        elif self.ok_n > 0:
-            self.ok_miss += 1
-            if self.ok_miss > 2:
-                self.ok_n = 0
-                self.ok_miss = 0
-        scrolling = self.ok_n >= cfg.scroll_confirm_frames
-
         # ---------- Buttons ----------
-        # A fist or a peace sign often touches the thumb to the fingers:
-        # never treat that as a click.
-        clicks_allowed = raw != "FIST" and not peace_shape and self.ok_n == 0 and not custom_active
-        # Require the finger being pinched to actually be curled, so a naturally
-        # close thumb/finger distance (hand rotated toward the camera) is not a click.
-        want_left = (clicks_allowed and not ring
-                     and ring_ratio < cfg.pinch_close
-                     and ring_ratio <= pinky_ratio)
-        want_right = (clicks_allowed and not pinky
-                      and pinky_ratio < cfg.right_pinch_close
-                      and pinky_ratio < ring_ratio)
+        # A fist or a peace sign often touches the thumb to the fingers: never a click.
+        clicks_allowed = raw != "FIST" and not peace_shape and not custom_active
 
-        # Left button: pinch + release = click. Pinch held = drag.
-        if self.left_down:
-            if ring_ratio > cfg.pinch_open:
-                pyautogui.mouseUp()
-                self.left_down = False
-                self.left_n = 0
-        elif self.left_pending:
-            if ring_ratio > cfg.pinch_open:
-                pyautogui.click()                 # quick pinch: a real click
-                self.left_pending = False
-                self.left_n = 0
-            elif now - self.left_pending_t >= cfg.drag_hold_s:
-                pyautogui.mouseDown()             # held: start dragging
-                self.left_down = True
-                self.left_pending = False
+        # Thumb + INDEX: a quick tap = left click. The OK sign (middle, ring and
+        # pinky up) held for scroll_hold_s = scroll instead.
+        idx_thr = cfg.scroll_pinch_open if self.idx_pending else cfg.scroll_pinch_close
+        idx_pinched = idx_ratio < idx_thr
+        if self.idx_pending:
+            self.idx_miss = 0 if idx_pinched else self.idx_miss + 1
+            if self.idx_miss >= 2:                          # fingers opened
+                if not self.scrolling and now - self.idx_t <= cfg.tap_max_s:
+                    self.out.click()
+                self._disarm()
+                self.idx_pending = False
+                self.scrolling = False
+                self.idx_n = 0
+            elif (not self.scrolling and now - self.idx_t >= cfg.scroll_hold_s
+                  and middle and ring and pinky):
+                self.scrolling = True
         else:
-            self.left_n = self.left_n + 1 if want_left else 0
-            if self.left_n >= cfg.click_confirm_frames and not self.right_latched:
-                self.left_pending = True
-                self.left_pending_t = now
+            want_idx = (clicks_allowed and self.armed["idx"] and idx_pinched
+                        and not self.left_down and not self.right_latched
+                        and idx_ratio < mid_ratio and idx_ratio < ring_ratio)
+            self.idx_n = self.idx_n + 1 if want_idx else 0
+            if self.idx_n >= cfg.click_confirm_frames:
+                self.idx_pending, self.idx_t, self.idx_miss = True, now, 0
+                self.armed["idx"] = False
+                self._rewind(now)
 
-        # Right click: fires once per pinch, re-arms when released.
+        # Thumb + RING held = drag. It lets go as soon as the fingers open a little
+        # past their tightest point, so a drag can't get stuck.
+        if self.left_down:
+            self.ring_min = min(self.ring_min, ring_ratio)
+            if ring_ratio > min(cfg.pinch_open, self.ring_min + cfg.release_margin):
+                self.out.mouseUp()
+                self.left_down = False
+                self.ring_n = 0
+                self._disarm()
+        else:
+            # The pinched finger must really be curled, so a hand turned toward
+            # the camera (fingers merely look close) doesn't count.
+            want_drag = (clicks_allowed and self.armed["ring"] and not ring
+                         and not self.idx_pending and not self.right_latched
+                         and ring_ratio < cfg.pinch_close
+                         and ring_ratio <= mid_ratio and ring_ratio < idx_ratio)
+            self.ring_n = self.ring_n + 1 if want_drag else 0
+            if self.ring_n >= cfg.click_confirm_frames + 1:
+                self._rewind(now)
+                self.out.mouseDown()
+                self.left_down = True
+                self.ring_min = ring_ratio
+                self.armed["ring"] = False
+
+        # Thumb + MIDDLE = right click, once per pinch.
         if self.right_latched:
-            if pinky_ratio > cfg.right_pinch_open:
+            self.mid_min = min(self.mid_min, mid_ratio)
+            if mid_ratio > min(cfg.right_pinch_open, self.mid_min + cfg.release_margin):
                 self.right_latched = False
                 self.right_n = 0
-        elif not self.left_down and not self.left_pending:
+                self._disarm()
+        elif not self.left_down and not self.idx_pending:
+            want_right = (clicks_allowed and self.armed["mid"] and not middle
+                          and mid_ratio < cfg.right_pinch_close
+                          and mid_ratio < ring_ratio and mid_ratio < idx_ratio)
             self.right_n = self.right_n + 1 if want_right else 0
             if self.right_n >= cfg.click_confirm_frames:
-                pyautogui.rightClick()
+                self._rewind(now)
+                self.out.rightClick()
                 self.right_latched = True
+                self.mid_min = mid_ratio
+                self.armed["mid"] = False
 
         # ---------- Scroll ----------
-        if scrolling:
+        if self.scrolling:
             y = pts[9][1] / h
             if self.scroll_y is not None:
                 dy = y - self.scroll_y
@@ -1206,7 +1377,7 @@ class AirMouse:
                 self.scroll_acc += -dy * cfg.scroll_gain
                 n = int(self.scroll_acc)
                 if n:
-                    pyautogui.scroll(n)
+                    self.out.scroll(n)
                     self.scroll_acc -= n
             self.scroll_y = y
             self.status = "SCROLL"
@@ -1216,16 +1387,17 @@ class AirMouse:
 
         # ---------- Cursor movement ----------
         # Freeze while a pinch is forming so the cursor doesn't drift off the target.
-        pinch_forming = ((want_left or want_right) and not self.left_down) or self.left_pending
+        pinch_forming = self.idx_n > 0 or self.ring_n > 0 or self.right_n > 0 or self.idx_pending
         moving = self.left_down or (
             self.pose == "POINT" and not pinch_forming and not self.right_latched
-            and self.ok_n == 0 and not peace_active and not custom_active
+            and not peace_active and not custom_active
         )
 
         if moving:
             p = landmarks[cfg.pointer_landmark]
             sx, sy = self._to_screen(p.x, p.y, now)
-            pyautogui.moveTo(sx, sy)
+            self.out.moveTo(sx, sy)
+            self.cur_hist.append((now, sx, sy))
             self.status = "DRAGGING" if self.left_down else "MOVE"
         elif custom_active:
             self.status = (f"GESTURE: {self.cg.name} {self.cg_pct}%" if self.cg_fired is None
@@ -1235,8 +1407,8 @@ class AirMouse:
                            else "YOUTUBE OPENED")
         elif self.right_latched:
             self.status = "RIGHT CLICK"
-        elif self.ok_n > 0:
-            self.status = "OK SIGN..."
+        elif self.idx_pending:
+            self.status = "CLICK (or hold OK sign to scroll)"
         elif self.pose == "PALM":
             self.status = self.flash_text if now < self.flash_until else "PALM: swipe L / R"
         elif self.pose == "FIST":
@@ -1261,6 +1433,7 @@ class TwoHandZoom:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.out = DESKTOP         # swapped for a PracticeOutput during the tutorial
         self.enabled = cfg.zoom_enabled
         self.reset()
         self.t_last = -1e9
@@ -1283,11 +1456,11 @@ class TwoHandZoom:
 
     def _send(self, steps):
         mod = "command" if sys.platform == "darwin" else "ctrl"
-        pyautogui.keyDown(mod)
+        self.out.keyDown(mod)
         try:
-            pyautogui.scroll(steps * self.WHEEL_NOTCH)
+            self.out.scroll(steps * self.WHEEL_NOTCH)
         finally:
-            pyautogui.keyUp(mod)
+            self.out.keyUp(mod)
 
     def update(self, hands, w, h, now):
         """Returns True while zoom owns the hands (the mouse should do nothing)."""
@@ -1343,6 +1516,427 @@ class TwoHandZoom:
         cv2.line(frame, a, b, color, 2)
         for p in (a, b):
             cv2.circle(frame, p, 9, color, 2)
+
+
+# ============================================================
+# First-run tutorial (T replays it). Gestures drive a virtual cursor on a
+# practice board drawn over the camera view; nothing touches the real desktop.
+# ============================================================
+SETTINGS_PATH = os.path.join(app_dir(), "air_mouse_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(data, f, indent=1)
+    except OSError as e:
+        print(f"Could not save {SETTINGS_PATH}: {e}")
+
+
+class Tutorial:
+    # (id, title, instruction lines)
+    LESSONS = [
+        ("welcome", "WELCOME TO AIR MOUSE",
+         ["This short tutorial teaches every gesture on a safe practice board.",
+          "Nothing on your real desktop is clicked until it ends.",
+          "Hold ONE hand up inside the white box, palm facing the camera."]),
+        ("calibrate", "CALIBRATE",
+         ["Follow the steps at the bottom so clicks fit YOUR hand."]),
+        ("move", "MOVE THE CURSOR",
+         ["Point with your index finger: the cursor follows your fingertip.",
+          "Touch each glowing target in turn."]),
+        ("click", "LEFT CLICK",
+         ["Move onto the button, then TAP thumb + INDEX fingertips together",
+          "and let go quickly. Click the button twice."]),
+        ("right", "RIGHT CLICK",
+         ["Move onto the button, then pinch THUMB + MIDDLE finger.",
+          "Right-click the button once."]),
+        ("drag", "DRAG AND DROP",
+         ["Move onto the box. Pinch THUMB + RING and HOLD to grab it,",
+          "move it into the green zone, then open your fingers to drop."]),
+        ("scroll", "SCROLL",
+         ["Make an OK sign: pinch THUMB + INDEX, other three fingers up.",
+          "HOLD it a moment, then move your hand DOWN, then UP."]),
+        ("freeze", "FREEZE THE CURSOR",
+         ["Make a tight FIST: the cursor stops so you can reposition your arm.",
+          "Hold the fist for 1.5 seconds."]),
+        ("zoom", "TWO-HAND ZOOM",
+         ["Pinch THUMB + INDEX on BOTH hands.",
+          "Spread your hands apart to zoom in, bring them together to zoom out."]),
+        ("alttab", "SWITCH WINDOWS (ALT+TAB)",
+         ["Show an OPEN PALM (all four fingers up), then swipe quickly",
+          "RIGHT for the next window and LEFT for the previous one."]),
+        ("modes", "YOU'RE READY!",
+         ["P pause (Ctrl+Alt+P from any window)    C recalibrate    D debug",
+          "F  FX mode: Rasengan on your other palm, both hands = Absolute Cinema",
+          "E  3D Machine Explorer        G  record your own gesture",
+          "Emergency stop: push the real mouse into a screen corner.",
+          "Press SPACE to start using the real air mouse.  T replays this tutorial."]),
+    ]
+    TARGETS = [(0.22, 0.32), (0.78, 0.36), (0.50, 0.62)]        # move lesson
+    BUTTON = (0.38, 0.34, 0.24, 0.20)                           # x, y, w, h (normalized)
+    ZONE = (0.66, 0.26, 0.24, 0.40)                             # drag drop zone
+    SCROLL_NEED = 400                                           # scroll units each way
+    ZOOM_NEED = 3                                               # zoom steps each way
+    FIST_NEED_S = 1.5
+    WELCOME_NEED_S = 1.5
+    DONE_PAUSE_S = 1.2                                          # "Nice!" before next lesson
+
+    def __init__(self, am, zoom, calib):
+        self.am, self.zoom, self.calib = am, zoom, calib
+        self.active = False
+        self.out = None
+        self.i = 0
+
+    # ---------- lifecycle ----------
+    @property
+    def lesson(self):
+        return self.LESSONS[self.i][0]
+
+    def start(self, now):
+        am = self.am
+        am.release_all()
+        am.reset_filters()
+        self.zoom.reset()
+        self.out = PracticeOutput(am.sw, am.sh)
+        am.out = self.zoom.out = self.out
+        self.saved_swipe = am.swipe_enabled
+        am.swipe_enabled = True                 # the Alt+Tab lesson needs it
+        self.active = True
+        self._begin(0, now)
+        print("Tutorial started (SPACE = skip lesson, Esc = exit)")
+
+    def stop(self, now, completed):
+        if not self.active:
+            return
+        if self.calib.active:
+            self.calib.cancel(now)
+        am = self.am
+        am.release_all()                        # still goes to the practice board
+        am.out = self.zoom.out = DESKTOP
+        am.swipe_enabled = self.saved_swipe
+        am.reset_filters()
+        self.zoom.reset()
+        self.active = False
+        settings = load_settings()
+        settings["tutorial_done"] = True        # don't auto-start again; T replays it
+        save_settings(settings)
+        notify("Tutorial complete! The air mouse now controls your real mouse." if completed
+               else "Tutorial closed. Press T any time to replay it.", ok=True, secs=5.0)
+        print("Tutorial", "completed" if completed else "closed")
+
+    def skip(self, now):
+        if self.calib.active:
+            self.calib.cancel(now)
+        self._next(now)
+
+    def _next(self, now):
+        if self.i + 1 >= len(self.LESSONS):
+            self.stop(now, completed=True)
+        else:
+            self._begin(self.i + 1, now)
+
+    def _begin(self, i, now):
+        self.i = i
+        self.done_at = None
+        self.t_last = now
+        self.out.take_events()
+        self.am.release_all()
+        self.hint = ""
+        self.hand_t = 0.0                       # welcome
+        self.target = 0                         # move
+        self.hits = 0                           # click / right
+        self.box = [0.16, 0.46]                 # drag: box centre (normalized)
+        self.grab = None                        # drag: offset while held
+        self.scroll_down = self.scroll_up = 0   # scroll
+        self.list_off = 0.0
+        self.fist_t = 0.0                       # freeze
+        self.zin = self.zout = 0                # zoom
+        self.zlevel = 0
+        self.tab_r = self.tab_l = 0             # alt+tab
+        self.tab_sel = 0
+        if self.lesson == "calibrate":
+            self.calib.start(now)
+        else:
+            self.calib.message_until = 0.0      # its message would cover our panel
+
+    def _done(self, now):
+        if self.done_at is None:
+            self.done_at = now
+
+    # ---------- helpers ----------
+    def _cursor(self, x=None, y=None):
+        """Normalized (0..1) board position of the virtual cursor (or of x, y)."""
+        o = self.out
+        return ((o.x if x is None else x) / max(o.sw, 1), (o.y if y is None else y) / max(o.sh, 1))
+
+    @staticmethod
+    def _inside(p, rect):
+        x, y, w, h = rect
+        return x <= p[0] <= x + w and y <= p[1] <= y + h
+
+    def _box_rect(self):
+        return (self.box[0] - 0.06, self.box[1] - 0.08, 0.12, 0.16)
+
+    # ---------- per frame ----------
+    def update(self, hands, now):
+        if not self.active:
+            return
+        dt = min(now - self.t_last, 0.2)
+        self.t_last = now
+        events = self.out.take_events()
+        if self.done_at is not None:
+            # after calibration, leave time to read its result message
+            pause = 3.0 if self.lesson == "calibrate" else self.DONE_PAUSE_S
+            if now - self.done_at >= pause:
+                self._next(now)
+            return
+
+        lesson = self.lesson
+        if lesson == "welcome":
+            self.hand_t = self.hand_t + dt if hands else max(0.0, self.hand_t - dt)
+            if self.hand_t >= self.WELCOME_NEED_S:
+                self._done(now)
+
+        elif lesson == "calibrate":
+            if not self.calib.active:            # finished (or cancelled with Esc)
+                self._done(now)
+
+        elif lesson == "move":
+            tx, ty = self.TARGETS[self.target]
+            cx, cy = self._cursor()
+            if ((cx - tx) / 0.07) ** 2 + ((cy - ty) / 0.09) ** 2 <= 1.0:
+                self.target += 1
+                if self.target >= len(self.TARGETS):
+                    self._done(now)
+
+        elif lesson in ("click", "right"):
+            want = "click" if lesson == "click" else "right"
+            other = "right" if lesson == "click" else "click"
+            for kind, _, x, y in events:
+                if kind == want:
+                    if self._inside(self._cursor(x, y), self.BUTTON):
+                        self.hits += 1
+                        self.hint = ""
+                    else:
+                        self.hint = "Missed - move onto the button first, then pinch."
+                elif kind == other:
+                    self.hint = ("That was a RIGHT click (middle). TAP thumb + INDEX instead." if want == "click"
+                                 else "That was a LEFT click (index). Pinch thumb + MIDDLE instead.")
+                elif kind == "down":
+                    self.hint = "That's a DRAG (ring). " + ("TAP thumb + INDEX to click." if want == "click"
+                                                            else "Pinch thumb + MIDDLE to right-click.")
+            if self.hits >= (2 if lesson == "click" else 1):
+                self._done(now)
+
+        elif lesson == "drag":
+            for kind, _, x, y in events:
+                p = self._cursor(x, y)
+                if kind == "down" and self._inside(p, self._box_rect()):
+                    self.grab = (self.box[0] - p[0], self.box[1] - p[1])
+                    self.hint = ""
+                elif kind == "up" and self.grab is not None:
+                    self.grab = None
+                    if self._inside(self.box, self.ZONE):
+                        self._done(now)
+                    else:
+                        self.hint = "Dropped outside the zone - grab it again."
+                elif kind == "click" and self._inside(p, self._box_rect()):
+                    self.hint = "That was a click (index). Grab with thumb + RING and keep it HELD."
+            if self.grab is not None and self.out.down:
+                cx, cy = self._cursor()
+                self.box = [min(max(cx + self.grab[0], 0.06), 0.94),
+                            min(max(cy + self.grab[1], 0.08), 0.92)]
+
+        elif lesson == "scroll":
+            for kind, n, _, _ in events:
+                if kind == "scroll":
+                    if n < 0:
+                        self.scroll_down += -n
+                    elif self.scroll_down >= self.SCROLL_NEED:
+                        self.scroll_up += n
+                    self.list_off = min(max(self.list_off - n / 600.0, 0.0), 1.0)
+            if self.scroll_down >= self.SCROLL_NEED and self.scroll_up >= self.SCROLL_NEED:
+                self._done(now)
+
+        elif lesson == "freeze":
+            self.fist_t = self.fist_t + dt if (hands and self.am.pose == "FIST") else 0.0
+            if self.fist_t >= self.FIST_NEED_S:
+                self._done(now)
+
+        elif lesson == "zoom":
+            for kind, n, _, _ in events:
+                if kind == "zoom":
+                    steps = int(round(n / TwoHandZoom.WHEEL_NOTCH))
+                    self.zlevel = min(max(self.zlevel + steps, -4), 6)
+                    if steps > 0:
+                        self.zin += steps
+                    elif self.zin >= self.ZOOM_NEED:
+                        self.zout += -steps
+            if self.zin >= self.ZOOM_NEED and self.zout >= self.ZOOM_NEED:
+                self._done(now)
+
+        elif lesson == "alttab":
+            for kind, d, _, _ in events:
+                if kind == "alttab":
+                    self.tab_sel = (self.tab_sel + d) % 4
+                    if d > 0:
+                        self.tab_r += 1
+                    else:
+                        self.tab_l += 1
+            if self.tab_r and self.tab_l:
+                self._done(now)
+        # "modes" waits for SPACE (skip)
+
+    # ---------- drawing ----------
+    def _progress(self):
+        lesson = self.lesson
+        if lesson == "welcome":
+            return min(self.hand_t / self.WELCOME_NEED_S, 1.0), "Hold your hand up..."
+        if lesson == "move":
+            return self.target / len(self.TARGETS), f"Targets {self.target}/{len(self.TARGETS)}"
+        if lesson == "click":
+            return self.hits / 2, f"Clicks {self.hits}/2"
+        if lesson == "right":
+            return float(self.hits), "Right-click the button"
+        if lesson == "drag":
+            return (1.0 if self._inside(self.box, self.ZONE) else 0.0), (
+                "Holding the box - move to the zone" if self.grab else "Grab the box")
+        if lesson == "scroll":
+            if self.scroll_down < self.SCROLL_NEED:
+                return 0.5 * self.scroll_down / self.SCROLL_NEED, "Scroll DOWN (move your hand down)"
+            return 0.5 + 0.5 * min(self.scroll_up / self.SCROLL_NEED, 1.0), "Now scroll UP (move your hand up)"
+        if lesson == "freeze":
+            return min(self.fist_t / self.FIST_NEED_S, 1.0), "Hold a tight fist"
+        if lesson == "zoom":
+            if self.zin < self.ZOOM_NEED:
+                return 0.5 * self.zin / self.ZOOM_NEED, f"Zoom IN {self.zin}/{self.ZOOM_NEED} (spread apart)"
+            return (0.5 + 0.5 * min(self.zout / self.ZOOM_NEED, 1.0),
+                    f"Zoom OUT {self.zout}/{self.ZOOM_NEED} (bring together)")
+        if lesson == "alttab":
+            return (self.tab_r > 0) * 0.5 + (self.tab_l > 0) * 0.5, (
+                f"Swipe RIGHT {'done' if self.tab_r else '...'}   Swipe LEFT {'done' if self.tab_l else '...'}")
+        return 0.0, ""
+
+    def draw(self, frame, now):
+        if not self.active:
+            return frame
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        lesson = self.lesson
+        P = lambda nx, ny: (int(nx * w), int(ny * h))           # noqa: E731
+
+        def rect(r, color, thick=2, fill=None):
+            x, y, rw, rh = r
+            if fill is not None:
+                cv2.rectangle(frame, P(x, y), P(x + rw, y + rh), fill, -1)
+            cv2.rectangle(frame, P(x, y), P(x + rw, y + rh), color, thick)
+
+        # Dim the camera image so the practice board stands out
+        if lesson not in ("welcome", "calibrate"):
+            frame = cv2.addWeighted(frame, 0.45, np.zeros_like(frame), 0.55, 0)
+
+        pulse = 0.5 + 0.5 * math.sin(now * 6)
+        if lesson == "move":
+            for k, (tx, ty) in enumerate(self.TARGETS):
+                if k < self.target:
+                    cv2.circle(frame, P(tx, ty), 10, (0, 200, 0), -1)
+                elif k == self.target:
+                    cv2.circle(frame, P(tx, ty), int(0.07 * w), (0, 255, 255), 2)
+                    cv2.circle(frame, P(tx, ty), int(0.07 * w * (0.4 + 0.3 * pulse)), (0, 200, 255), -1)
+        elif lesson in ("click", "right"):
+            hot = self._inside(self._cursor(), self.BUTTON)
+            rect(self.BUTTON, (255, 255, 255), 2, fill=(0, 140, 255) if hot else (90, 90, 90))
+            label = "CLICK ME" if lesson == "click" else "RIGHT-CLICK ME"
+            x, y, bw, bh = self.BUTTON
+            (tw, _), _ = cv2.getTextSize(label, font, 0.55, 2)
+            cv2.putText(frame, label, (int((x + bw / 2) * w - tw / 2), int((y + bh / 2) * h) + 6),
+                        font, 0.55, (255, 255, 255), 2)
+        elif lesson == "drag":
+            in_zone = self._inside(self.box, self.ZONE)
+            rect(self.ZONE, (0, 255, 0), 2, fill=(0, 90, 0) if in_zone else (0, 50, 0))
+            cv2.putText(frame, "DROP HERE", P(self.ZONE[0] + 0.03, self.ZONE[1] + 0.06), font, 0.5, (0, 255, 0), 1)
+            rect(self._box_rect(), (255, 255, 255), 2, fill=(255, 140, 0) if self.grab else (200, 100, 0))
+        elif lesson == "scroll":
+            panel = (0.30, 0.22, 0.40, 0.46)
+            rect(panel, (255, 255, 255), 1, fill=(40, 40, 40))
+            x, y, pw, ph = panel
+            row_h = 0.065
+            first = self.list_off * 12
+            for r in range(20):
+                ry = y + 0.02 + (r - first) * row_h
+                if y + 0.01 <= ry <= y + ph - row_h:
+                    cv2.putText(frame, f"Item {r + 1}", P(x + 0.03, ry + 0.045), font, 0.5, (230, 230, 230), 1)
+            bar_y = y + self.list_off * (ph - 0.08)
+            cv2.rectangle(frame, P(x + pw - 0.02, bar_y), P(x + pw - 0.008, bar_y + 0.08), (0, 200, 255), -1)
+        elif lesson == "freeze":
+            frozen = self.am.pose == "FIST"
+            cv2.putText(frame, "FROZEN" if frozen else "make a fist", P(0.36, 0.45),
+                        font, 1.0, (0, 255, 255) if frozen else (160, 160, 160), 2)
+        elif lesson == "zoom":
+            s = 0.10 * (1.18 ** self.zlevel)
+            cx, cy = 0.5, 0.45
+            cv2.rectangle(frame, P(cx - s, cy - s * w / h * 0.75), P(cx + s, cy + s * w / h * 0.75), (255, 200, 0), -1)
+            cv2.circle(frame, P(cx, cy), max(int(s * w * 0.35), 3), (40, 40, 40), -1)
+            cv2.putText(frame, f"zoom {int(100 * 1.18 ** self.zlevel)}%", P(0.42, 0.24), font, 0.5, (255, 255, 255), 1)
+        elif lesson == "alttab":
+            for k in range(4):
+                r = (0.14 + k * 0.19, 0.34, 0.15, 0.20)
+                sel = k == self.tab_sel
+                rect(r, (0, 255, 255) if sel else (150, 150, 150), 3 if sel else 1,
+                     fill=(70, 70, 70) if sel else (35, 35, 35))
+                cv2.putText(frame, f"Window {k + 1}", P(r[0] + 0.01, r[1] + 0.11), font, 0.42, (255, 255, 255), 1)
+
+        # Virtual cursor (every lesson where the mouse is used)
+        if lesson in ("move", "click", "right", "drag", "scroll", "zoom", "freeze"):
+            c = P(*self._cursor())
+            col = (0, 0, 255) if self.out.down else (255, 255, 255)
+            pts = np.array([c, (c[0], c[1] + 20), (c[0] + 5, c[1] + 15), (c[0] + 13, c[1] + 15)], np.int32)
+            cv2.fillPoly(frame, [pts], col)
+            cv2.polylines(frame, [pts], True, (0, 0, 0), 1)
+
+        # Instruction panel
+        title = self.LESSONS[self.i][1]
+        header = f"TUTORIAL {self.i + 1}/{len(self.LESSONS)}: {title}"
+        footer = "SPACE " + ("finish" if lesson == "modes" else "skip lesson") + "    Esc exit tutorial"
+        if lesson == "calibrate":                # the calibration panel owns the bottom
+            cv2.rectangle(frame, (8, 92), (w - 8, 140), (20, 20, 20), -1)
+            cv2.putText(frame, header, (16, 112), font, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, self.LESSONS[self.i][2][0] + "   " + footer, (16, 132), font, 0.4,
+                        (255, 255, 255), 1)
+            return frame
+        lines = self.LESSONS[self.i][2]
+        frac, prog = self._progress()
+        if self.am.paused:
+            prog = "PAUSED - press P to resume"
+        elif self.hint:
+            prog = self.hint
+        n = len(lines)
+        top = h - 8 - (64 + 18 * n) - (14 if lesson != "modes" else 0)
+        cv2.rectangle(frame, (8, top), (w - 8, h - 8), (20, 20, 20), -1)
+        cv2.putText(frame, header, (16, top + 20), font, 0.5, (0, 255, 255), 1)
+        for k, ln in enumerate(lines):
+            cv2.putText(frame, ln, (16, top + 42 + 18 * k), font, 0.42, (255, 255, 255), 1)
+        y = top + 42 + 18 * n
+        if self.done_at is not None:
+            cv2.putText(frame, "NICE!", (16, y + 6), font, 0.6, (0, 255, 0), 2)
+        elif lesson != "modes":
+            color = (0, 0, 255) if (self.hint or self.am.paused) else (0, 255, 0)
+            cv2.putText(frame, prog, (16, y + 4), font, 0.42, color, 1)
+            cv2.rectangle(frame, (16, y + 12), (w - 16, y + 18), (70, 70, 70), -1)
+            cv2.rectangle(frame, (16, y + 12), (16 + int((w - 32) * frac), y + 18), (0, 255, 0), -1)
+            y += 14
+        cv2.putText(frame, footer, (16, h - 16), font, 0.4, (180, 180, 180), 1)
+        return frame
 
 
 class LoopingVideo:
@@ -1428,15 +2022,16 @@ def draw_hand(frame, landmarks, w, h, pointer=8):
     cv2.circle(frame, pts[pointer], 8, (0, 255, 255), 2)  # pointer
 
 
-def draw_hud(frame, am, fps, fx_mode=False):
+def draw_hud(frame, am, fps, fx_mode=False, show_region=True):
     h, w = frame.shape[:2]
     rx, ry, rw, rh = am.region
-    cv2.rectangle(
-        frame,
-        (int(rx * w), int(ry * h)),
-        (int((rx + rw) * w), int((ry + rh) * h)),
-        (255, 255, 255), 1,
-    )
+    if show_region:
+        cv2.rectangle(
+            frame,
+            (int(rx * w), int(ry * h)),
+            (int((rx + rw) * w), int((ry + rh) * h)),
+            (255, 255, 255), 1,
+        )
     color = (0, 255, 255) if not am.paused else (0, 165, 255)
     cv2.rectangle(frame, (8, 8), (w - 8, 82 if am.debug else 62), (20, 20, 20), -1)
     cv2.putText(frame, am.status, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -1506,9 +2101,10 @@ def draw_recorder(frame, rec, now):
 # Defaults for gesture thresholds (the air_mouse Config overrides these,
 # including your calibrated values)
 DEFAULTS = dict(
-    pinch_close=0.45, pinch_open=0.70,
-    right_pinch_close=0.55, right_pinch_open=0.85,
-    scroll_pinch_close=0.40, scroll_pinch_open=0.60,
+    pinch_close=0.45, pinch_open=0.70,                 # ring   (calibrated)
+    right_pinch_close=0.45, right_pinch_open=0.70,     # middle (calibrated)
+    scroll_pinch_close=0.40, scroll_pinch_open=0.60,   # index  (calibrated)
+    pinky_pinch_close=0.55, pinky_pinch_open=0.85,     # pinky  (not calibrated)
     extend_ratio=1.2, fist_tip_ratio=1.1,
     swipe_dist=0.20, swipe_window_s=0.35, swipe_min_speed=0.9,
 )
@@ -2910,9 +3506,9 @@ class Explorer:
         self.fist_t, self.fist_done = None, False
 
         specs = {"index": ("scroll_pinch_close", "scroll_pinch_open", "rotate"),
-                 "middle": ("pinch_close", "pinch_open", "select"),
+                 "middle": ("right_pinch_close", "right_pinch_open", "select"),
                  "ring": ("pinch_close", "pinch_open", "zoom"),
-                 "pinky": ("right_pinch_close", "right_pinch_open", "isolate")}
+                 "pinky": ("pinky_pinch_close", "pinky_pinch_open", "isolate")}
 
         if self.pinch is None:
             best, bv = None, 9.0
@@ -3394,6 +3990,7 @@ def main():
     am.gestures = gestures
     zoom = TwoHandZoom(cfg)
     am.zoom = zoom
+    tutorial = Tutorial(am, zoom, calib)
     os.makedirs(cfg.machines_dir, exist_ok=True)   # so users can see where models go
     explorer = Explorer(cfg, builtin_machines() + load_machines(cfg.machines_dir, cfg.models_z_up))
     explore_mode = False           # 3D machine explorer mode (E), toggled just like FX mode (F)
@@ -3412,6 +4009,9 @@ def main():
     read_failures = 0
 
     print(__doc__)
+
+    if not load_settings().get("tutorial_done"):
+        tutorial.start(time.perf_counter())       # first launch: teach the gestures
 
     try:
         while True:
@@ -3538,6 +4138,7 @@ def main():
                 am.on_no_hand()
 
             am.tick(now)
+            tutorial.update(hands, now)
 
             fps_n += 1
             if now - fps_t >= 1.0:
@@ -3547,7 +4148,9 @@ def main():
             if explore_mode:
                 cv2.imshow(window, explorer.render(now, preview=frame))
             else:
-                draw_hud(frame, am, fps, fx_mode)
+                frame = tutorial.draw(frame, now)
+                draw_hud(frame, am, fps, fx_mode,
+                         show_region=not tutorial.active or tutorial.lesson == "welcome")
                 draw_calibration(frame, calib, now)
                 draw_recorder(frame, recorder, now)
                 cv2.imshow(window, frame)
@@ -3555,6 +4158,24 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or window_closed(window):
                 break
+            if tutorial.active:
+                if key == 27:                    # Esc: end calibration step, or leave the tutorial
+                    if calib.active:
+                        calib.cancel(time.perf_counter())
+                    else:
+                        tutorial.stop(time.perf_counter(), completed=False)
+                    continue
+                if key == ord(" "):
+                    tutorial.skip(time.perf_counter())
+                    continue
+                if key in (ord("e"), ord("f"), ord("g"), ord("u"), ord("c"), ord("t")):
+                    continue                     # mode changes wait until the tutorial ends
+            elif (key == ord("t") and not explore_mode and not recorder.active
+                    and not calib.active):
+                fx_mode = am.fx_mode = False
+                two_hands_n = 0
+                tutorial.start(time.perf_counter())
+                continue
             if key == ord("e"):
                 explore_mode = not explore_mode
                 explorer.active = explore_mode
