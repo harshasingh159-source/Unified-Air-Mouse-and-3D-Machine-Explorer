@@ -91,12 +91,14 @@ Poses that already do something (open palm, pointing, plain fist, pinches) can't
 
 - The mouse hand works as normal.
 - **Peace sign** held for 1 s opens YouTube in Chrome.
-- **Other hand, palm up**: Rasengan effect on your palm (`rasengan.mp4`).
+- **Other hand, palm up**: Blast effect on your palm (`blast.mp4`).
 - **Snap your fingers (either hand)**: you dissolve into dust and **vanish**, with the room
   painted over you. Snap again to come back. "SNAP READY" shows when your thumb and middle finger
   are pressed together. For a clean vanish, press `B` and step out of view during the 3-second
   countdown so it learns the empty room. The bottom line shows how much of the room it knows.
   In FX mode, thumb + middle is the snap, so right-click is off there.
+- **Three fingers up** (index, middle and ring, with the pinky down) on either hand: **fire**
+  rises from your fingertips and follows your hand.
 - **Other hand, fist then open it fast**: **power burst**, with a shockwave, sparks and a screen shake.
 - **Other hand, thumb and index spread apart** (other fingers curled): **lightning** crackles
   between the two fingertips.
@@ -165,7 +167,7 @@ Calibration, custom gestures and the `machines/` folder are also stored next to 
 | `AirMouse.spec` | PyInstaller build configuration |
 | `hand_landmarker.task` | MediaPipe hand-tracking model |
 | `selfie_segmenter.tflite` | MediaPipe person-segmentation model (FX mode vanish effect) |
-| `rasengan.mp4`, `absolute_cinema.mp4` | FX mode videos |
+| `blast.mp4`, `absolute_cinema.mp4` | FX mode videos |
 | `air_mouse_calibration.json` | Your calibration thresholds (created when you calibrate, not in git) |
 | `custom_gestures.json` | Your recorded gestures (created when you record one, not in git) |
 | `air_mouse_settings.json` | Remembers that the tutorial was shown (created by the app, not in git) |

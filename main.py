@@ -39,10 +39,11 @@ CUSTOM GESTURES (air mouse and FX mode):
 FX MODE (F):
   Mouse hand ......... works exactly as above
   Peace sign (hold 1s) Opens YouTube in Chrome (mouse hand)
-  Other hand, palm up  Rasengan overlay on your palm (needs rasengan.mp4)
+  Other hand, palm up  Blast overlay on your palm (needs blast.mp4)
   SNAP (either hand)   you dissolve and VANISH; snap again to come back.
                        Press B, then step out of view for 3s so it learns the room.
                        (In FX mode thumb + middle is the snap, so no right click.)
+  3 fingers up (index, middle, ring; pinky down), either hand: FIRE from the fingertips
   Other hand, fist then open fast   POWER BURST: shockwave + sparks + shake
   Other hand, thumb + index spread  LIGHTNING between the two fingertips
   Both hands ......... Absolute Cinema (needs absolute_cinema.mp4)
@@ -222,11 +223,11 @@ class Config:
     global_pause_hotkey: str = "<ctrl>+<alt>+p"
 
     # FX mode. MediaPipe labels hands from the mirrored image. If mouse and
-    # Rasengan are on the wrong hands, swap these two values.
+    # Blast are on the wrong hands, swap these two values.
     mouse_hand_label: str = "Left"
     fx_hand_label: str = "Right"
     cinema_confirm_frames: int = 5   # both hands must be seen this many frames
-    rasengan_video: str = resource_path("rasengan.mp4")
+    blast_video: str = resource_path("blast.mp4")
     cinema_video: str = resource_path("absolute_cinema.mp4")
 
     # Peace sign -> YouTube (FX mode only)
@@ -1425,7 +1426,7 @@ class AirMouse:
 
 
 # ============================================================
-# FX helpers (Rasengan / Absolute Cinema)
+# FX helpers (Blast / Absolute Cinema)
 # ============================================================
 class TwoHandZoom:
     """Two-hand pinch zoom for the air mouse.
@@ -1584,7 +1585,7 @@ class Tutorial:
           "RIGHT for the next window and LEFT for the previous one."]),
         ("modes", "YOU'RE READY!",
          ["P pause (Ctrl+Alt+P from any window)    C recalibrate    D debug",
-          "F  FX mode (other hand): Rasengan, snap = vanish, burst, lightning",
+          "F  FX mode: Blast, snap = vanish, fire, burst, lightning",
           "E  3D Machine Explorer        G  record your own gesture",
           "Emergency stop: push the real mouse into a screen corner.",
           "Press SPACE to start using the real air mouse.  T replays this tutorial."]),
@@ -1978,7 +1979,7 @@ def fingers_extended(pts, ratio):
     ]
 
 
-def overlay_rasengan(frame, video_frame, cx, cy, size):
+def overlay_blast(frame, video_frame, cx, cy, size):
     """Chroma-key a green-screen video onto the frame around (cx, cy)."""
     h, w = frame.shape[:2]
     if video_frame is None or video_frame.size == 0:
@@ -2019,7 +2020,7 @@ def overlay_rasengan(frame, video_frame, cx, cy, size):
 
 # ============================================================
 # More FX-mode effects, drawn live (no video files). All use the FX hand
-# (your OTHER hand, the one that makes the Rasengan):
+# (your OTHER hand, the one that makes the Blast):
 #   SNAP your fingers ......... you dissolve and vanish; snap again to come back
 #   FIST, then open quickly ... POWER BURST: shockwave, sparks, screen shake
 #   THUMB + INDEX spread ...... LIGHTNING crackles between the two fingertips
@@ -2171,6 +2172,7 @@ class FXEffects:
     def reset(self):
         self.vanish.reset()
         self.parts = []          # [x, y, vx, vy, born, life, (b, g, r), size, drag]
+        self.flames = []         # [x, y, vx, vy, born, life, size]
         self.rings = []          # [x, y, born, max_radius, (b, g, r)]
         self.shake_until = 0.0
         self.bolt = None
@@ -2221,7 +2223,7 @@ class FXEffects:
     # ---------- gestures of the FX hand ----------
     def hand(self, pts, now):
         """Check the FX hand for snap / burst / lightning.
-        Returns a status text while an effect owns the hand (the Rasengan is skipped)."""
+        Returns a status text while an effect owns the hand (the Blast is skipped)."""
         cfg = self.cfg
         scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
         ext = fingers_extended(pts, cfg.extend_ratio)
@@ -2231,6 +2233,8 @@ class FXEffects:
         s = self.snap(pts, now, "fx")
         if s:
             return s
+        if self.fire(pts, now):
+            return "FIRE!"
 
         # Power burst: a fist, then the hand bursts open.
         if fist:
@@ -2261,6 +2265,34 @@ class FXEffects:
             self.parts.append([cx, cy, math.cos(a) * s, math.sin(a) * s, now,
                                float(self.rng.uniform(0.5, 1.0)), col, int(self.rng.integers(3, 7)), 0.94])
         self.shake_until = now + 0.35
+
+    # ---------- fire fingers (either hand) ----------
+    def fire(self, pts, now):
+        """Index, middle and ring up, pinky down: flames rise from those three
+        fingertips. Returns True while burning (the open-palm Blast uses all four)."""
+        ext = fingers_extended(pts, self.cfg.extend_ratio)
+        if not (ext[0] and ext[1] and ext[2] and not ext[3]):
+            return False
+        scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
+        for tip in (8, 12, 16):
+            x, y = float(pts[tip][0]), float(pts[tip][1])
+            for _ in range(5):
+                self.flames.append([x + self.rng.uniform(-0.12, 0.12) * scale, y,
+                                    float(self.rng.uniform(-70, 70)), float(self.rng.uniform(-300, -110)),
+                                    now, float(self.rng.uniform(0.3, 0.7)),
+                                    float(self.rng.uniform(0.09, 0.17)) * scale])
+        return True
+
+    @staticmethod
+    def _flame_color(f):
+        """Colour of a flame particle at age fraction f (BGR): white-yellow -> orange -> red -> out."""
+        stops = ((0.0, (190, 250, 255)), (0.2, (40, 210, 255)), (0.5, (0, 120, 255)),
+                 (0.8, (0, 30, 200)), (1.0, (0, 0, 40)))
+        for (f0, c0), (f1, c1) in zip(stops, stops[1:]):
+            if f <= f1:
+                k = (f - f0) / (f1 - f0)
+                return tuple(int(a + (b - a) * k) for a, b in zip(c0, c1))
+        return stops[-1][1]
 
     def spawn_dust(self, frame, mask, now, n=60):
         """While vanishing, bits of the person drift away like dust."""
@@ -2332,6 +2364,20 @@ class FXEffects:
             cv2.circle(glow, (int(p[0]), int(p[1])), p[7], col, -1)
         self.parts = live[-1500:]
 
+        live = []
+        for p in self.flames:                             # fire fingers
+            age = now - p[4]
+            if age > p[5]:
+                continue
+            p[2] += float(self.rng.uniform(-160, 160)) * dt  # flicker sideways
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            live.append(p)
+            f = age / p[5]
+            cv2.circle(glow, (int(p[0]), int(p[1])), max(1, int(p[6] * (1.0 - 0.7 * f))),
+                       self._flame_color(f), -1)
+        self.flames = live[-1200:]
+
         if self.bolt is not None and now - self.bolt_t < 0.08:
             p1, p2 = self.bolt
             for _ in range(3):
@@ -2341,7 +2387,7 @@ class FXEffects:
             for p in (p1, p2):
                 cv2.circle(glow, (int(p[0]), int(p[1])), 12, (255, 200, 120), -1)
 
-        if core or self.rings or self.parts:
+        if core or self.rings or self.parts or self.flames:
             frame = cv2.add(frame, cv2.GaussianBlur(glow, (0, 0), 9))
             frame = cv2.add(frame, glow)
             for path in core:
@@ -4344,7 +4390,7 @@ def main():
     cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)
 
     fx = FXEffects(cfg)            # snap-to-vanish, power burst, lightning (FX mode)
-    rasengan = LoopingVideo(cfg.rasengan_video)
+    blast = LoopingVideo(cfg.blast_video)
     cinema = LoopingVideo(cfg.cinema_video)
     fx_mode = False
     two_hands_n = 0
@@ -4495,6 +4541,8 @@ def main():
                     if fx_mode:                      # snap works with the mouse hand too
                         mpts = np.array([[l.x * w, l.y * h] for l in mouse_lm])
                         s = fx.snap(mpts, now, "mouse")
+                        if not s and fx.fire(mpts, now):
+                            s = "FIRE!"
                         if s:
                             fx_status = am.status = s
                         if am.debug:
@@ -4503,7 +4551,7 @@ def main():
                 else:
                     am.on_no_hand()
 
-                # ---- Rasengan: FX hand with an open / cupped palm ----
+                # ---- Blast: FX hand with an open / cupped palm ----
                 if fx_lm is not None:
                     fpts = np.array([[l.x * w, l.y * h] for l in fx_lm])
                     for a, b in HAND_CONNECTIONS:
@@ -4511,12 +4559,12 @@ def main():
                     fx_status = fx.hand(fpts, now)       # snap / power burst / lightning
                     if fx_status:
                         am.status = fx_status
-                    elif sum(fingers_extended(fpts, cfg.extend_ratio)) >= 3 and rasengan.ok:
-                        rf = rasengan.read()
+                    elif sum(fingers_extended(fpts, cfg.extend_ratio)) >= 3 and blast.ok:
+                        rf = blast.read()
                         palm_center = (fpts[5] + fpts[9] + fpts[17]) / 3.0
                         palm_w = np.linalg.norm(fpts[5] - fpts[17])
-                        frame = overlay_rasengan(frame, rf, palm_center[0], palm_center[1], palm_w * 2.0)
-                        am.status = "RASENGAN!"
+                        frame = overlay_blast(frame, rf, palm_center[0], palm_center[1], palm_w * 2.0)
+                        am.status = "BLAST!"
             else:
                 am.on_no_hand()
 
@@ -4627,7 +4675,7 @@ def main():
                 fx.reset()                       # come back visible, clear effects
                 am.release_all()
                 am.reset_filters()
-                for name, vid in (("rasengan.mp4", rasengan), ("absolute_cinema.mp4", cinema)):
+                for name, vid in (("blast.mp4", blast), ("absolute_cinema.mp4", cinema)):
                     if fx_mode and not vid.ok:
                         print(f"FX mode: {name} not found (effect will be skipped).")
 
@@ -4638,7 +4686,7 @@ def main():
         am.release_all()
         hotkey.stop()
         detector.close()
-        rasengan.release()
+        blast.release()
         cinema.release()
         cap.release()
         cv2.destroyAllWindows()

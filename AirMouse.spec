@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('hand_landmarker.task', '.'), ('selfie_segmenter.tflite', '.'), ('rasengan.mp4', '.'), ('absolute_cinema.mp4', '.')]
+datas = [('hand_landmarker.task', '.'), ('selfie_segmenter.tflite', '.'), ('blast.mp4', '.'), ('absolute_cinema.mp4', '.')]
 binaries = []
 hiddenimports = ['pynput.keyboard._win32', 'pynput.mouse._win32']
 tmp_ret = collect_all('mediapipe')
