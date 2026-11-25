@@ -92,6 +92,14 @@ Poses that already do something (open palm, pointing, plain fist, pinches) can't
 - The mouse hand works as normal.
 - **Peace sign** held for 1 s opens YouTube in Chrome.
 - **Other hand, palm up**: Rasengan effect on your palm (`rasengan.mp4`).
+- **Snap your fingers (either hand)**: you dissolve into dust and **vanish**, with the room
+  painted over you. Snap again to come back. "SNAP READY" shows when your thumb and middle finger
+  are pressed together. For a clean vanish, press `B` and step out of view during the 3-second
+  countdown so it learns the empty room. The bottom line shows how much of the room it knows.
+  In FX mode, thumb + middle is the snap, so right-click is off there.
+- **Other hand, fist then open it fast**: **power burst**, with a shockwave, sparks and a screen shake.
+- **Other hand, thumb and index spread apart** (other fingers curled): **lightning** crackles
+  between the two fingertips.
 - **Both hands**: "Absolute Cinema" overlay (`absolute_cinema.mp4`).
 
 ## 3D Machine Explorer (`E`)
@@ -129,7 +137,7 @@ Textures are not shown.
 | `P` | Pause | `U` | Remove last gesture |
 | `D` | Debug overlay | `Q` | Quit |
 | `C` | Calibrate (`Esc` cancels) | `Z` | Two-hand zoom on/off |
-| `T` | Tutorial on/off | | |
+| `T` | Tutorial on/off | `B` | FX mode: learn the empty room (vanish trick) |
 
 **Global pause:** `Ctrl+Alt+P` works from any window (needs `pynput`).
 
@@ -156,6 +164,7 @@ Calibration, custom gestures and the `machines/` folder are also stored next to 
 | `main.py` | The whole application |
 | `AirMouse.spec` | PyInstaller build configuration |
 | `hand_landmarker.task` | MediaPipe hand-tracking model |
+| `selfie_segmenter.tflite` | MediaPipe person-segmentation model (FX mode vanish effect) |
 | `rasengan.mp4`, `absolute_cinema.mp4` | FX mode videos |
 | `air_mouse_calibration.json` | Your calibration thresholds (created when you calibrate, not in git) |
 | `custom_gestures.json` | Your recorded gestures (created when you record one, not in git) |

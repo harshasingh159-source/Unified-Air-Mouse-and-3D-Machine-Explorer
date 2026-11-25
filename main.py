@@ -40,6 +40,11 @@ FX MODE (F):
   Mouse hand ......... works exactly as above
   Peace sign (hold 1s) Opens YouTube in Chrome (mouse hand)
   Other hand, palm up  Rasengan overlay on your palm (needs rasengan.mp4)
+  SNAP (either hand)   you dissolve and VANISH; snap again to come back.
+                       Press B, then step out of view for 3s so it learns the room.
+                       (In FX mode thumb + middle is the snap, so no right click.)
+  Other hand, fist then open fast   POWER BURST: shockwave + sparks + shake
+  Other hand, thumb + index spread  LIGHTNING between the two fingertips
   Both hands ......... Absolute Cinema (needs absolute_cinema.mp4)
 
 3D MACHINE EXPLORER MODE (E):  the mouse is switched off; your hands drive a 3D viewer
@@ -63,6 +68,7 @@ Keys (camera window focused):
   F fx mode   E 3D explorer   P pause   D debug   C calibrate (Esc cancels)
   S swipe on/off   Z two-hand zoom on/off   G record gesture   U remove last gesture
   T tutorial on/off (also runs by itself on first launch; SPACE skips a lesson)
+  B (FX mode) learn the empty room for the vanish trick: step out of view for 3s
   Q quit (or close the window)
 GLOBAL PAUSE: Ctrl+Alt+P works from ANY window (needs: pip install pynput)
 EMERGENCY STOP: slam your physical mouse into any screen corner
@@ -1356,7 +1362,8 @@ class AirMouse:
                 self.right_n = 0
                 self._disarm()
         elif not self.left_down and not self.idx_pending:
-            want_right = (clicks_allowed and self.armed["mid"] and not middle
+            # In FX mode thumb + middle is the finger SNAP (vanish), so no right click there.
+            want_right = (clicks_allowed and not self.fx_mode and self.armed["mid"] and not middle
                           and mid_ratio < cfg.right_pinch_close
                           and mid_ratio < ring_ratio and mid_ratio < idx_ratio)
             self.right_n = self.right_n + 1 if want_right else 0
@@ -1577,7 +1584,7 @@ class Tutorial:
           "RIGHT for the next window and LEFT for the previous one."]),
         ("modes", "YOU'RE READY!",
          ["P pause (Ctrl+Alt+P from any window)    C recalibrate    D debug",
-          "F  FX mode: Rasengan on your other palm, both hands = Absolute Cinema",
+          "F  FX mode (other hand): Rasengan, snap = vanish, burst, lightning",
           "E  3D Machine Explorer        G  record your own gesture",
           "Emergency stop: push the real mouse into a screen corner.",
           "Press SPACE to start using the real air mouse.  T replays this tutorial."]),
@@ -2008,6 +2015,362 @@ def overlay_rasengan(frame, video_frame, cx, cy, size):
     fg = cv2.bitwise_and(r, r, mask=cv2.bitwise_not(mask))
     frame[y1:y2, x1:x2] = cv2.add(bg, fg)
     return frame
+
+
+# ============================================================
+# More FX-mode effects, drawn live (no video files). All use the FX hand
+# (your OTHER hand, the one that makes the Rasengan):
+#   SNAP your fingers ......... you dissolve and vanish; snap again to come back
+#   FIST, then open quickly ... POWER BURST: shockwave, sparks, screen shake
+#   THUMB + INDEX spread ...... LIGHTNING crackles between the two fingertips
+# ============================================================
+_BUNDLED_SEG = resource_path("selfie_segmenter.tflite")
+SEG_MODEL_PATH = (_BUNDLED_SEG if os.path.exists(_BUNDLED_SEG)
+                  else os.path.join(app_dir(), "selfie_segmenter.tflite"))
+SEG_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+                 "selfie_segmenter/float16/latest/selfie_segmenter.tflite")
+
+
+class Vanish:
+    """Hides the person by painting the learned background over them.
+    The background is learned all the time in FX mode from every pixel where
+    you are NOT standing, so it fills in as you move (or step aside once)."""
+    FADE_S = 0.9
+    SEG_W, SEG_H = 256, 192          # segmentation runs on a small copy (fast)
+
+    def __init__(self):
+        self.seg = None
+        self.failed = False
+        self.reset()
+
+    CAPTURE_COUNTDOWN_S = 3.0        # B: time to step out of view...
+    CAPTURE_S = 1.0                  # ...then the empty room is recorded for this long
+
+    def reset(self):
+        self.gone = False            # what the last snap asked for
+        self.alpha = 0.0             # 0 = fully visible ... 1 = fully invisible
+        self.bg = None               # learned background (small, float32)
+        self.seen = None             # background pixels seen at least once
+        self.fill = None             # background with unseen holes filled (frame size)
+        self.fill_t = -1e9
+        self.t_last = None
+        self.m_ema = None            # person mask smoothed over time (no flicker)
+        self.capture_t = None        # when B was pressed
+
+    def toggle(self):
+        self.gone = not self.gone
+        return self.gone
+
+    @property
+    def coverage(self):
+        """How much of the room behind you is known (0..1)."""
+        return 0.0 if self.seen is None else float(self.seen.mean())
+
+    def start_capture(self, now):
+        self.capture_t = now
+
+    def capture_state(self, now):
+        """('countdown', seconds left) / ('capturing', 0) / (None, 0)."""
+        if self.capture_t is None:
+            return None, 0
+        el = now - self.capture_t
+        if el < self.CAPTURE_COUNTDOWN_S:
+            return "countdown", self.CAPTURE_COUNTDOWN_S - el
+        if el < self.CAPTURE_COUNTDOWN_S + self.CAPTURE_S:
+            return "capturing", 0
+        self.capture_t = None
+        return None, 0
+
+    def _segmenter(self):
+        if self.seg is None and not self.failed:
+            try:
+                if not os.path.exists(SEG_MODEL_PATH):
+                    print("Downloading the selfie segmentation model (vanish effect)...")
+                    tmp = SEG_MODEL_PATH + ".part"
+                    urllib.request.urlretrieve(SEG_MODEL_URL, tmp)
+                    os.replace(tmp, SEG_MODEL_PATH)
+                opts = vision.ImageSegmenterOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=SEG_MODEL_PATH),
+                    running_mode=vision.RunningMode.IMAGE,
+                    output_confidence_masks=True, output_category_mask=False)
+                self.seg = vision.ImageSegmenter.create_from_options(opts)
+            except Exception as e:
+                self.failed = True
+                print(f"Vanish effect unavailable: {e}")
+        return self.seg
+
+    def apply(self, frame, rgb, now):
+        """Returns (frame with the person faded out by alpha, person mask or None)."""
+        dt = 0.0 if self.t_last is None else min(now - self.t_last, 0.1)
+        self.t_last = now
+        seg = self._segmenter()
+        if seg is None:
+            return frame, None
+        h, w = frame.shape[:2]
+        small = cv2.resize(rgb, (self.SEG_W, self.SEG_H), interpolation=cv2.INTER_AREA)
+        res = seg.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(small)))
+        m = res.confidence_masks[0].numpy_view()
+        m = m.reshape(m.shape[0], m.shape[1]).astype(np.float32)
+        # Smooth over time so the cut-out doesn't flicker, and grow it a little so
+        # no outline of you is left behind.
+        self.m_ema = m if self.m_ema is None else self.m_ema * 0.5 + m * 0.5
+        grown = cv2.dilate(self.m_ema, np.ones((7, 7), np.uint8))
+
+        # Learn the background wherever the person surely isn't (well away from
+        # the outline, so bits of you never get baked into the background).
+        bgr_small = cv2.cvtColor(small, cv2.COLOR_RGB2BGR).astype(np.float32)
+        if self.bg is None:
+            self.bg = bgr_small.copy()
+            self.seen = np.zeros(m.shape, bool)
+        capturing = self.capture_state(now)[0] == "capturing"
+        free = grown < (0.5 if capturing else 0.1)
+        rate = 0.5 if capturing else 0.2
+        self.bg[free] = self.bg[free] * (1 - rate) + bgr_small[free] * rate
+        new = free & ~self.seen
+        self.bg[new] = bgr_small[new]
+        if new.any() or capturing:
+            self.fill = None                     # background changed: rebuild the fill
+        self.seen |= free
+
+        step = dt / self.FADE_S
+        self.alpha = min(1.0, self.alpha + step) if self.gone else max(0.0, self.alpha - step)
+        mask = cv2.GaussianBlur(cv2.resize(grown, (w, h)), (0, 0), 4)
+        if self.alpha <= 0.0:
+            return frame, mask
+        if self.fill is None or now - self.fill_t > 0.5:
+            bg8 = np.clip(self.bg, 0, 255).astype(np.uint8)
+            holes = (~self.seen).astype(np.uint8) * 255
+            if holes.any():
+                bg8 = cv2.inpaint(bg8, holes, 5, cv2.INPAINT_TELEA)
+            self.fill = cv2.resize(bg8, (w, h)).astype(np.float32)
+            self.fill_t = now
+        a = (np.clip(mask * 1.6, 0, 1) * self.alpha)[..., None]
+        out = frame.astype(np.float32) * (1.0 - a) + self.fill * a
+        return out.astype(np.uint8), mask
+
+
+class FXEffects:
+    # A snap = thumb + middle fingertip pressed together (middle finger still out),
+    # then within SNAP_WINDOW_S the gap opens a lot AND the middle fingertip drops
+    # toward the wrist (it hits your palm). Watching the motion over a short time
+    # window makes it work even if the camera blurs or drops a frame mid-snap.
+    SNAP_TOUCH = 0.45        # thumb-middle gap that counts as "pressed" (/ hand size)
+    SNAP_MID_OUT = 1.15      # middle fingertip this far from the wrist while pressed
+    SNAP_OPEN = 0.30         # the gap must then grow by at least this...
+    SNAP_DROP = 0.25         # ...while the middle fingertip drops at least this much
+    SNAP_WINDOW_S = 0.40
+    BURST_WINDOW_S = 0.35    # fist -> open hand must happen this fast
+    LIGHTNING_GAP = 0.55     # thumb-index gap that starts the lightning
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.vanish = Vanish()
+        self.rng = np.random.default_rng()
+        self.reset()
+
+    def reset(self):
+        self.vanish.reset()
+        self.parts = []          # [x, y, vx, vy, born, life, (b, g, r), size, drag]
+        self.rings = []          # [x, y, born, max_radius, (b, g, r)]
+        self.shake_until = 0.0
+        self.bolt = None
+        self.bolt_t = -1e9
+        self.fist_t = -1e9
+        self.burst_t = -1e9
+        self.snap_hist = {}      # per hand: deque of (t, thumb-middle gap, middle reach)
+        self.snap_metrics = {}   # per hand: latest (gap, reach), for the debug line
+        self.snap_t = -1e9
+        self.text = ""
+        self.text_until = 0.0
+        self.t_draw = None
+
+    def _say(self, text, now, secs=1.3):
+        self.text, self.text_until = text, now + secs
+
+    # ---------- finger snap (either hand) ----------
+    def snap(self, pts, now, key):
+        """Watch one hand for a finger snap. Returns "SNAP!" when it happens,
+        "SNAP READY" while thumb + middle are pressed for a snap, else None."""
+        scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
+        gap = np.linalg.norm(pts[4] - pts[12]) / scale        # thumb tip - middle tip
+        reach = np.linalg.norm(pts[12] - pts[0]) / scale      # middle tip - wrist
+        self.snap_metrics[key] = (gap, reach)
+        hist = self.snap_hist.setdefault(key, deque())
+        hist.append((now, gap, reach))
+        while hist and now - hist[0][0] > self.SNAP_WINDOW_S:
+            hist.popleft()
+        pressed = gap < self.SNAP_TOUCH and reach > self.SNAP_MID_OUT
+        if now - self.snap_t < 0.8:
+            return None
+        for _, g1, r1 in hist:
+            if (g1 < self.SNAP_TOUCH and r1 > self.SNAP_MID_OUT
+                    and gap - g1 >= self.SNAP_OPEN and r1 - reach >= self.SNAP_DROP):
+                self.snap_t = now
+                for hh in self.snap_hist.values():
+                    hh.clear()
+                gone = self.vanish.toggle()
+                c = (pts[4] + pts[12]) / 2
+                self.rings.append([c[0], c[1], now, scale * 1.2, (255, 255, 255)])
+                if gone and self.vanish.coverage < 0.6:
+                    self._say("*SNAP*  (press B to learn the room)", now, 2.0)
+                else:
+                    self._say("*SNAP*  ...gone" if gone else "*SNAP*  ...back!", now)
+                return "SNAP!"
+        return "SNAP READY - flick!" if pressed else None
+
+    # ---------- gestures of the FX hand ----------
+    def hand(self, pts, now):
+        """Check the FX hand for snap / burst / lightning.
+        Returns a status text while an effect owns the hand (the Rasengan is skipped)."""
+        cfg = self.cfg
+        scale = np.linalg.norm(pts[9] - pts[0]) + 1e-6
+        ext = fingers_extended(pts, cfg.extend_ratio)
+        fist = all(np.linalg.norm(pts[t] - pts[0]) < cfg.fist_tip_ratio * scale for t in (8, 12, 16, 20))
+        ti = np.linalg.norm(pts[4] - pts[8]) / scale
+
+        s = self.snap(pts, now, "fx")
+        if s:
+            return s
+
+        # Power burst: a fist, then the hand bursts open.
+        if fist:
+            self.fist_t = now
+        elif sum(ext) >= 3 and now - self.fist_t < self.BURST_WINDOW_S and now - self.burst_t > 0.6:
+            self.burst_t, self.fist_t = now, -1e9
+            self._burst((pts[0] + pts[5] + pts[17]) / 3, scale, now)
+            self._say("POWER BURST!", now, 0.8)
+            return "POWER BURST!"
+
+        # Lightning: index out, other three curled, thumb spread away from the index.
+        if (ext[0] and not ext[1] and not ext[2] and not ext[3] and ti > self.LIGHTNING_GAP
+                and not fist and now - self.snap_t > 0.6):      # not the hand right after a snap
+            self.bolt, self.bolt_t = (pts[4].copy(), pts[8].copy()), now
+            return "LIGHTNING!"
+        return None
+
+    def _burst(self, c, scale, now):
+        cx, cy = float(c[0]), float(c[1])
+        for i, col in enumerate(((255, 255, 255), (80, 200, 255), (0, 120, 255))):
+            self.rings.append([cx, cy, now + i * 0.07, scale * (3.2 + i * 0.9), col])
+        n = 140
+        ang = self.rng.uniform(0, 2 * math.pi, n)
+        spd = self.rng.uniform(180, 700, n)
+        palette = ((255, 255, 255), (120, 230, 255), (40, 170, 255), (0, 90, 255))
+        for a, s in zip(ang, spd):
+            col = palette[self.rng.integers(len(palette))]
+            self.parts.append([cx, cy, math.cos(a) * s, math.sin(a) * s, now,
+                               float(self.rng.uniform(0.5, 1.0)), col, int(self.rng.integers(3, 7)), 0.94])
+        self.shake_until = now + 0.35
+
+    def spawn_dust(self, frame, mask, now, n=60):
+        """While vanishing, bits of the person drift away like dust."""
+        ys, xs = np.nonzero(mask[::4, ::4] > 0.6)
+        if len(xs) == 0:
+            return
+        pick = self.rng.integers(0, len(xs), min(n, len(xs)))
+        for i in pick:
+            x, y = int(xs[i]) * 4, int(ys[i]) * 4
+            b, g, r = (int(v) for v in frame[min(y, frame.shape[0] - 1), min(x, frame.shape[1] - 1)])
+            self.parts.append([float(x), float(y), float(self.rng.uniform(-40, 120)),
+                               float(self.rng.uniform(-220, -60)), now,
+                               float(self.rng.uniform(0.5, 1.1)), (b, g, r), 2, 0.97])
+
+    # ---------- drawing ----------
+    def _bolt_path(self, p1, p2):
+        pts = [np.asarray(p1, float), np.asarray(p2, float)]
+        disp = 0.22 * np.linalg.norm(pts[1] - pts[0])
+        for _ in range(5):
+            new = []
+            for a, b in zip(pts, pts[1:]):
+                d = b - a
+                n = np.array([-d[1], d[0]]) / (np.linalg.norm(d) + 1e-6)
+                new += [a, (a + b) / 2 + n * self.rng.uniform(-disp, disp)]
+            new.append(pts[-1])
+            pts, disp = new, disp * 0.55
+        return np.array(pts, np.int32)
+
+    def draw(self, frame, now):
+        h, w = frame.shape[:2]
+        dt = 0.0 if self.t_draw is None else min(now - self.t_draw, 0.1)
+        self.t_draw = now
+
+        if now < self.shake_until:                      # screen shake after a burst
+            k = (self.shake_until - now) / 0.35
+            dx, dy = self.rng.uniform(-14, 14, 2) * k
+            frame = cv2.warpAffine(frame, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h),
+                                   borderMode=cv2.BORDER_REFLECT)
+
+        glow = np.zeros_like(frame)
+        core = []                                         # thin white lines drawn on top
+
+        live = []
+        for r in self.rings:
+            t = (now - r[2]) / 0.55
+            if t > 1.0:
+                continue
+            live.append(r)
+            if t < 0:
+                continue
+            rad = int(r[3] * (1 - (1 - t) ** 3))
+            fade = 1.0 - t
+            col = tuple(int(c * fade) for c in r[4])
+            cv2.circle(glow, (int(r[0]), int(r[1])), max(rad, 1), col, max(2, int(16 * fade)))
+        self.rings = live
+
+        live = []
+        for p in self.parts:
+            age = now - p[4]
+            if age > p[5]:
+                continue
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[2] *= p[8]
+            p[3] *= p[8]
+            live.append(p)
+            fade = 1.0 - age / p[5]
+            col = tuple(int(c * fade) for c in p[6])
+            cv2.circle(glow, (int(p[0]), int(p[1])), p[7], col, -1)
+        self.parts = live[-1500:]
+
+        if self.bolt is not None and now - self.bolt_t < 0.08:
+            p1, p2 = self.bolt
+            for _ in range(3):
+                path = self._bolt_path(p1, p2)
+                cv2.polylines(glow, [path], False, (255, 170, 60), 5)
+                core.append(path)
+            for p in (p1, p2):
+                cv2.circle(glow, (int(p[0]), int(p[1])), 12, (255, 200, 120), -1)
+
+        if core or self.rings or self.parts:
+            frame = cv2.add(frame, cv2.GaussianBlur(glow, (0, 0), 9))
+            frame = cv2.add(frame, glow)
+            for path in core:
+                cv2.polylines(frame, [path], False, (255, 255, 255), 1)
+
+        state, left = self.vanish.capture_state(now)
+        if state is not None:
+            msg = (f"Step out of view... {int(left) + 1}" if state == "countdown"
+                   else "Learning the empty room...")
+            font = cv2.FONT_HERSHEY_DUPLEX
+            (tw, _), _ = cv2.getTextSize(msg, font, 1.0, 2)
+            org = ((w - tw) // 2, int(h * 0.5))
+            cv2.putText(frame, msg, org, font, 1.0, (0, 0, 0), 6)
+            cv2.putText(frame, msg, org, font, 1.0, (0, 255, 0) if state == "capturing" else (255, 255, 255), 2)
+        elif not self.vanish.failed:
+            cov = self.vanish.coverage
+            msg = (f"snap = vanish | room learned {int(cov * 100)}%"
+                   + ("  (B: learn room)" if cov < 0.95 else ""))
+            cv2.putText(frame, msg, (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3)
+            cv2.putText(frame, msg, (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 0) if cov >= 0.95 else (0, 220, 255), 1)
+
+        if now < self.text_until and self.text:
+            font = cv2.FONT_HERSHEY_DUPLEX
+            (tw, th), _ = cv2.getTextSize(self.text, font, 1.2, 3)
+            org = ((w - tw) // 2, int(h * 0.62))
+            cv2.putText(frame, self.text, org, font, 1.2, (0, 0, 0), 6)
+            cv2.putText(frame, self.text, org, font, 1.2, (0, 230, 255), 2)
+        return frame
 
 
 # ============================================================
@@ -3980,6 +4343,7 @@ def main():
     cv2.resizeWindow(window, 640, 480)
     cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)
 
+    fx = FXEffects(cfg)            # snap-to-vanish, power burst, lightning (FX mode)
     rasengan = LoopingVideo(cfg.rasengan_video)
     cinema = LoopingVideo(cfg.cinema_video)
     fx_mode = False
@@ -4048,6 +4412,14 @@ def main():
             labels = [c[0].category_name for c in result.handedness] if result.handedness else []
 
             two_hands_n = two_hands_n + 1 if (fx_mode and len(hands) >= 2) else 0
+
+            fx_status = None
+            if fx_mode and not explore_mode:
+                # Vanish: always learning the background; fades you out after a snap.
+                before = frame
+                frame, person = fx.vanish.apply(frame, rgb, now)
+                if person is not None and fx.vanish.gone and fx.vanish.alpha < 1.0:
+                    fx.spawn_dust(before, person, now)
 
             if explore_mode:
                 # ---- 3D machine explorer: the mouse is off, your hands drive the viewer ----
@@ -4120,6 +4492,14 @@ def main():
                 if mouse_lm is not None:
                     draw_hand(frame, mouse_lm, w, h, cfg.pointer_landmark)
                     am.on_hand(mouse_lm, w, h, now)
+                    if fx_mode:                      # snap works with the mouse hand too
+                        mpts = np.array([[l.x * w, l.y * h] for l in mouse_lm])
+                        s = fx.snap(mpts, now, "mouse")
+                        if s:
+                            fx_status = am.status = s
+                        if am.debug:
+                            g, r = fx.snap_metrics["mouse"]
+                            am.dbg += f" | snap gap {g:.2f} reach {r:.2f}"
                 else:
                     am.on_no_hand()
 
@@ -4128,7 +4508,10 @@ def main():
                     fpts = np.array([[l.x * w, l.y * h] for l in fx_lm])
                     for a, b in HAND_CONNECTIONS:
                         cv2.line(frame, tuple(fpts[a].astype(int)), tuple(fpts[b].astype(int)), (255, 255, 0), 2)
-                    if sum(fingers_extended(fpts, cfg.extend_ratio)) >= 3 and rasengan.ok:
+                    fx_status = fx.hand(fpts, now)       # snap / power burst / lightning
+                    if fx_status:
+                        am.status = fx_status
+                    elif sum(fingers_extended(fpts, cfg.extend_ratio)) >= 3 and rasengan.ok:
                         rf = rasengan.read()
                         palm_center = (fpts[5] + fpts[9] + fpts[17]) / 3.0
                         palm_w = np.linalg.norm(fpts[5] - fpts[17])
@@ -4148,6 +4531,10 @@ def main():
             if explore_mode:
                 cv2.imshow(window, explorer.render(now, preview=frame))
             else:
+                if fx_mode:
+                    frame = fx.draw(frame, now)
+                    if fx.vanish.gone and not fx_status and am.status in ("NO HAND", "MOVE"):
+                        am.status = "INVISIBLE - snap again to come back"
                 frame = tutorial.draw(frame, now)
                 draw_hud(frame, am, fps, fx_mode,
                          show_region=not tutorial.active or tutorial.lesson == "welcome",
@@ -4231,10 +4618,13 @@ def main():
                     calib.start(time.perf_counter())
             if key == 27 and calib.active:      # Esc
                 calib.cancel(time.perf_counter())
+            if key == ord("b") and fx_mode:      # learn the empty room for the vanish trick
+                fx.vanish.start_capture(time.perf_counter())
             if key == ord("f"):
                 fx_mode = not fx_mode
                 am.fx_mode = fx_mode
                 two_hands_n = 0
+                fx.reset()                       # come back visible, clear effects
                 am.release_all()
                 am.reset_filters()
                 for name, vid in (("rasengan.mp4", rasengan), ("absolute_cinema.mp4", cinema)):
