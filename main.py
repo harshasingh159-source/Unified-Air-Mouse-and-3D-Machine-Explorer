@@ -62,7 +62,7 @@ FX MODE (F):
 Keys (camera window focused):
   F fx mode   E 3D explorer   P pause   D debug   C calibrate (Esc cancels)
   S swipe on/off   Z two-hand zoom on/off   G record gesture   U remove last gesture
-  T tutorial (runs by itself on first launch; SPACE skips a lesson, Esc exits)
+  T tutorial on/off (also runs by itself on first launch; SPACE skips a lesson)
   Q quit (or close the window)
 GLOBAL PAUSE: Ctrl+Alt+P works from ANY window (needs: pip install pynput)
 EMERGENCY STOP: slam your physical mouse into any screen corner
@@ -1907,7 +1907,7 @@ class Tutorial:
         # Instruction panel
         title = self.LESSONS[self.i][1]
         header = f"TUTORIAL {self.i + 1}/{len(self.LESSONS)}: {title}"
-        footer = "SPACE " + ("finish" if lesson == "modes" else "skip lesson") + "    Esc exit tutorial"
+        footer = "SPACE " + ("finish" if lesson == "modes" else "skip lesson") + "    T or Esc: close tutorial"
         if lesson == "calibrate":                # the calibration panel owns the bottom
             cv2.rectangle(frame, (8, 92), (w - 8, 140), (20, 20, 20), -1)
             cv2.putText(frame, header, (16, 112), font, 0.5, (0, 255, 255), 1)
@@ -2022,7 +2022,7 @@ def draw_hand(frame, landmarks, w, h, pointer=8):
     cv2.circle(frame, pts[pointer], 8, (0, 255, 255), 2)  # pointer
 
 
-def draw_hud(frame, am, fps, fx_mode=False, show_region=True):
+def draw_hud(frame, am, fps, fx_mode=False, show_region=True, tutorial_on=False):
     h, w = frame.shape[:2]
     rx, ry, rw, rh = am.region
     if show_region:
@@ -2039,7 +2039,7 @@ def draw_hud(frame, am, fps, fx_mode=False, show_region=True):
     cv2.putText(frame, f"FPS {fps:.0f} P:pause F:fx({'ON' if fx_mode else 'off'}) D:debug C:calib "
                        f"S:swipe({'ON' if am.swipe_enabled else 'off'}) "
                        f"Z:zoom({'ON' if am.zoom is not None and am.zoom.enabled else 'off'}) "
-                       f"G:gesture({n_g}) E:3D Q:quit", (16, 52),
+                       f"G:gesture({n_g}) T:tutorial({'ON' if tutorial_on else 'off'}) E:3D Q:quit", (16, 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
     if am.debug:
         cv2.putText(frame, am.dbg, (16, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
@@ -4150,7 +4150,8 @@ def main():
             else:
                 frame = tutorial.draw(frame, now)
                 draw_hud(frame, am, fps, fx_mode,
-                         show_region=not tutorial.active or tutorial.lesson == "welcome")
+                         show_region=not tutorial.active or tutorial.lesson == "welcome",
+                         tutorial_on=tutorial.active)
                 draw_calibration(frame, calib, now)
                 draw_recorder(frame, recorder, now)
                 cv2.imshow(window, frame)
@@ -4168,7 +4169,10 @@ def main():
                 if key == ord(" "):
                     tutorial.skip(time.perf_counter())
                     continue
-                if key in (ord("e"), ord("f"), ord("g"), ord("u"), ord("c"), ord("t")):
+                if key == ord("t"):              # T toggles the tutorial, like F toggles FX mode
+                    tutorial.stop(time.perf_counter(), completed=False)
+                    continue
+                if key in (ord("e"), ord("f"), ord("g"), ord("u"), ord("c")):
                     continue                     # mode changes wait until the tutorial ends
             elif (key == ord("t") and not explore_mode and not recorder.active
                     and not calib.active):

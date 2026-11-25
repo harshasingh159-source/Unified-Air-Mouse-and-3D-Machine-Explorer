@@ -39,8 +39,9 @@ calibration and every gesture (move, click, right click, drag, scroll, freeze, t
 and Alt+Tab) on a **practice board** drawn over the camera view. During the tutorial, gestures
 move a virtual cursor only, so nothing on your real desktop gets clicked.
 
-- `SPACE` skips a lesson, and `Esc` exits the tutorial.
-- Press `T` any time to replay it.
+- `T` turns the tutorial on and off any time, just like `F` does for FX mode.
+  The top bar shows `T:tutorial(ON)` or `T:tutorial(off)`.
+- `SPACE` skips a lesson. `Esc` also closes the tutorial.
 
 > **Emergency stop:** push your physical mouse into any screen corner. The PyAutoGUI
 > fail-safe quits the program and releases all buttons.
@@ -128,7 +129,7 @@ Textures are not shown.
 | `P` | Pause | `U` | Remove last gesture |
 | `D` | Debug overlay | `Q` | Quit |
 | `C` | Calibrate (`Esc` cancels) | `Z` | Two-hand zoom on/off |
-| `T` | Replay the tutorial | | |
+| `T` | Tutorial on/off | | |
 
 **Global pause:** `Ctrl+Alt+P` works from any window (needs `pynput`).
 
